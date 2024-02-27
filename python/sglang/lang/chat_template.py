@@ -161,6 +161,21 @@ register_chat_template(
     )
 )
 
+
+register_chat_template(
+    ChatTemplate(
+        name="llama-2-chat-llava",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("<<SYS>>\n", "\n<</SYS>>\n\n"),
+            "user": ("[INST] ", " [/INST]"),
+            "assistant": ("", " </s><s>"),
+        },
+        style=ChatTemplateStyle.LLAMA2,
+        image_token=" <image>\n",
+    )
+)
+
 # Reference: https://github.com/01-ai/Yi/tree/main/VL#major-difference-with-llava
 register_chat_template(
     ChatTemplate(
@@ -198,6 +213,8 @@ def match_llama2_chat(model_path: str):
         return get_chat_template("llama-2-chat")
     if "codellama" in model_path and "instruct" in model_path:
         return get_chat_template("llama-2-chat")
+    if "llava-v1.6-mistral" in model_path:
+        return get_chat_template("llama-2-chat-llava")
 
 
 @register_chat_template_matching_function
@@ -209,6 +226,8 @@ def match_chat_ml(model_path: str):
         return get_chat_template("chatml")
     if "llava-v1.6-34b" in model_path:
         return get_chat_template("chatml-llava")
+    if "nous-hermes" in model_path:
+        return get_chat_template("chatml")
 
 
 @register_chat_template_matching_function
