@@ -61,7 +61,7 @@ def main(args):
     # Run requests
     tic = time.time()
     rets = few_shot_hellaswag.run_batch(
-        arguments, temperature=0, backend=backend, num_threads=args.parallel)
+        arguments, temperature=0, backend=backend, num_threads=args.parallel,progress_bar=True)
     preds = [choices[i].index(rets[i]["answer"]) for i in range(len(rets))]
     latency = time.time() - tic
 
@@ -89,8 +89,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-shot", type=int, default=20)
+    parser.add_argument("--num-shot", type=int, default=10)
     parser.add_argument("--data-path", type=str, default="hellaswag_val.jsonl")
-    parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument("--num-questions", type=int, default=10042)
     args = add_common_sglang_args_and_parse(parser)
     main(args)
