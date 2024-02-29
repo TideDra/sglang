@@ -226,7 +226,7 @@ def match_chat_ml(model_path: str):
         return get_chat_template("chatml")
     if "llava-v1.6-34b" in model_path:
         return get_chat_template("chatml-llava")
-    if "nous-hermes" in model_path:
+    if "nous-hermes-2" in model_path:
         return get_chat_template("chatml")
 
 
