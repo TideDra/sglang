@@ -214,6 +214,8 @@ def match_vicuna(model_path: str):
         return get_chat_template("vicuna_v1.1")
     if "llava-v1.5" in model_path.lower():
         return get_chat_template("vicuna_v1.1")
+    if "llava-1.5" in model_path.lower():
+        return get_chat_template("vicuna_v1.1")
 
 
 @register_chat_template_matching_function

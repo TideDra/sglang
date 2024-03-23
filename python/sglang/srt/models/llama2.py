@@ -290,12 +290,17 @@ class LlamaForCausalLM(nn.Module):
         for name, loaded_weight in hf_model_weights_iterator(
             model_name_or_path, cache_dir, load_format, revision
         ):
+            if "language_model.model" in name:
+                name = name.replace("language_model.model", "model")
+            if "language_model.lm_head" in name:
+                name = name.replace("language_model.lm_head", "lm_head")
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -304,6 +309,8 @@ class LlamaForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name.startswith("model.vision_tower") and name not in params_dict:
+                    continue
+                if name.startswith("vision_tower") and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -314,6 +321,8 @@ class LlamaForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name.startswith("model.vision_tower") and name not in params_dict:
+                    continue
+                if name.startswith("vision_tower") and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
