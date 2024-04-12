@@ -2,7 +2,7 @@
 from sglang.srt.models.llava import LlavaLlamaForCausalLM
 
 
-class LlavaForConditionalGeneration(LlavaLlamaForCausalLM):
+class LlavaNextForConditionalGeneration(LlavaLlamaForCausalLM):
     pass
 
-EntryClass = LlavaForConditionalGeneration
+EntryClass = LlavaNextForConditionalGeneration
