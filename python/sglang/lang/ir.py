@@ -97,9 +97,9 @@ class SglSamplingParams:
 
 
 class SglFunction:
-    def __init__(self, func, api_num_spec_tokens=None, bind_arguments=None):
+    def __init__(self, func, num_api_spec_tokens=None, bind_arguments=None):
         self.func = func
-        self.api_num_spec_tokens = api_num_spec_tokens
+        self.num_api_spec_tokens = num_api_spec_tokens
         self.bind_arguments = bind_arguments or {}
         self.pin_prefix_rid = None
 
@@ -193,17 +193,11 @@ class SglFunction:
         backend = backend or global_config.default_backend
         return trace_program(self, kwargs, backend)
 
-    def pin(self, backend=None):
-        from sglang.lang.interpreter import pin_program
+    def cache(self, backend=None):
+        from sglang.lang.interpreter import cache_program
 
         backend = backend or global_config.default_backend
-        return pin_program(self, backend)
-
-    def unpin(self, backend=None):
-        from sglang.lang.interpreter import unpin_program
-
-        backend = backend or global_config.default_backend
-        return unpin_program(self, backend)
+        return cache_program(self, backend)
 
     def compile(self, *, backend=None):
         from sglang.lang.compiler import compile_func
@@ -334,6 +328,15 @@ class SglImage(SglExpr):
 
     def __repr__(self) -> str:
         return f"SglImage({self.path})"
+
+
+class SglVideo(SglExpr):
+    def __init__(self, path, num_frames):
+        self.path = path
+        self.num_frames = num_frames
+
+    def __repr__(self) -> str:
+        return f"SglVideo({self.path}, {self.num_frames})"
 
 
 class SglGen(SglExpr):

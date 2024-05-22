@@ -1,15 +1,18 @@
 """The interpreter that executes SGL programs"""
 
 import asyncio
+import contextvars
 import multiprocessing
 import queue
 import threading
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import tqdm
+
 from sglang.global_config import global_config
 from sglang.lang.ir import (
     SglCommitLazy,
@@ -26,8 +29,13 @@ from sglang.lang.ir import (
     SglVariable,
     SglVarScopeBegin,
     SglVarScopeEnd,
+    SglVideo,
 )
-from sglang.utils import encode_image_base64
+from sglang.utils import (
+    encode_image_base64,
+    encode_video_base64,
+    get_exception_traceback,
+)
 
 
 def run_internal(state, program, func_args, func_kwargs, sync):
@@ -58,7 +66,7 @@ def run_program(
         default_sampling_para,
         chat_template=None,
         stream=stream,
-        api_num_spec_tokens=program.api_num_spec_tokens,
+        num_api_spec_tokens=program.num_api_spec_tokens,
     )
     state = ProgramState(stream_executor)
 
@@ -84,9 +92,9 @@ def run_program_batch(
     if hasattr(backend, "endpoint"):
         backend = backend.endpoint
 
-    # Extract prefix by tracing and cache it
-    if len(batch_arguments) > 1:
-        pin_program(program, backend)
+    # Pre-cache the common prefix for a batch. The prefix is extracted by tracing the program.
+    if global_config.enable_precache_with_tracing and len(batch_arguments) > 1:
+        cache_program(program, backend)
 
     # Run all programs
     if num_threads == "auto":
@@ -152,21 +160,12 @@ def run_program_batch(
     return rets
 
 
-def pin_program(program, backend):
-    if global_config.enable_prefix_sharing and program.pin_prefix_rid is None:
-        # TODO: handle multiple backends
-        from sglang.lang.tracer import extract_prefix_by_tracing
+def cache_program(program, backend):
+    from sglang.lang.tracer import extract_prefix_by_tracing
 
-        prefix = extract_prefix_by_tracing(program, backend)
-        if prefix and len(prefix) > 64:
-            prefix_rid = backend.cache_prefix(prefix)
-            program.pin_prefix_rid = prefix_rid
-            return prefix_rid
-    return None
-
-
-def unpin_program(program, backend):
-    pass
+    prefix = extract_prefix_by_tracing(program, backend)
+    if prefix and len(prefix) > 64:
+        backend.cache_prefix(prefix)
 
 
 class StreamExecutor:
@@ -179,7 +178,7 @@ class StreamExecutor:
         default_sampling_para,
         chat_template,
         stream,
-        api_num_spec_tokens=None,
+        num_api_spec_tokens=None,
         use_thread=True,
     ):
         self.sid = uuid.uuid4().hex
@@ -187,18 +186,15 @@ class StreamExecutor:
         self.arguments: Dict[str, Any] = arguments
         self.default_sampling_para = default_sampling_para
         self.stream = stream
-        self.api_num_spec_tokens = api_num_spec_tokens
 
         self.variables = {}  # Dict[name: str -> value: str]
         self.variable_event = {}  # Dict[name: str -> event: threading.Event]
         self.meta_info = {}  # Dict[name: str -> info: str]
         self.is_finished = False
+        self.error_ = None
 
         # For completion
         self.text_ = ""  # The full text
-
-        # For speculative execution
-        self.speculated_text = ""
 
         # For chat
         self.messages_ = []  # The messages in the OpenAI API format
@@ -213,11 +209,21 @@ class StreamExecutor:
         # For fork/join
         self.fork_start_text_pos = None
 
+        # For speculative execution
+        self.num_api_spec_tokens = num_api_spec_tokens
+        self.speculated_text = ""
+
         # Worker thread
         self.use_thread = use_thread
         if self.use_thread:
             self.queue = queue.Queue()
-            self.worker = threading.Thread(target=self._thread_worker_func)
+
+            def _run_worker_in_context():
+                self._thread_worker_func()
+
+            self.worker = threading.Thread(
+                target=contextvars.copy_context().run, args=(_run_worker_in_context,)
+            )
             self.worker.start()
 
         # For streaming
@@ -256,11 +262,16 @@ class StreamExecutor:
         ret = self.meta_info.get(name, None)
         return ret
 
-    def fork(self, number: int, position_ids_offset: Optional[List[int]] = None):
-        self.submit(SglCommitLazy())
-        self.sync()
+    def fork(
+        self,
+        size: int = 1,
+        position_ids_offset: Optional[List[int]] = None,
+    ):
+        if size > 1:
+            self.submit(SglCommitLazy())
 
-        number = int(number)
+        self.sync()
+        size = int(size)
 
         exes = [
             StreamExecutor(
@@ -270,15 +281,17 @@ class StreamExecutor:
                 self.chat_template,
                 self.stream,
             )
-            for _ in range(number)
+            for _ in range(size)
         ]
-        for i in range(number):
+        for i in range(size):
             exes[i].variables = dict(self.variables)
             exes[i].text_ = str(self.text_)
             exes[i].messages_ = list(self.messages_)
             exes[i].cur_role = self.cur_role
             exes[i].fork_start_text_pos = len(self.text_)
             exes[i].images_ = list(self.images_)
+
+            # TODO(ying): handle API speculative execution
 
         return exes
 
@@ -290,6 +303,10 @@ class StreamExecutor:
         self.sync()
         return self.messages_
 
+    def error(self):
+        self.sync()
+        return self.error_
+
     def end(self):
         if self.use_thread:
             if self.worker.is_alive():
@@ -297,16 +314,38 @@ class StreamExecutor:
         self.backend.end_program(self)
 
     def _thread_worker_func(self):
+        error = None
+
         while True:
             expr = self.queue.get()
             if expr is None:
                 self.queue.task_done()
                 break
 
-            self._execute(expr)
+            try:
+                self._execute(expr)
+            except Exception as e:
+                warnings.warn(f"Error in stream_executor: {get_exception_traceback()}")
+                error = e
+                break
             self.queue.task_done()
             if self.stream_text_event:
                 self.stream_text_event.set()
+
+        # Clean the queue and events
+        if error is not None:
+            try:
+                while True:
+                    self.queue.task_done()
+                    self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            for name in self.variable_event:
+                self.variable_event[name].set()
+            if self.stream_var_event:
+                for name in self.stream_var_event:
+                    self.stream_var_event[name].set()
+            self.error_ = error
 
         if self.stream_text_event:
             self.stream_text_event.set()
@@ -334,6 +373,8 @@ class StreamExecutor:
             self._execute_role_end(other)
         elif isinstance(other, SglImage):
             self._execute_image(other)
+        elif isinstance(other, SglVideo):
+            self._execute_video(other)
         elif isinstance(other, SglVariable):
             self._execute_variable(other)
         elif isinstance(other, SglVarScopeBegin):
@@ -353,12 +394,23 @@ class StreamExecutor:
         else:
             raise ValueError(f"Unknown type: {type(other)}")
 
-    def _execute_fill(self, value: str):
+    def _execute_fill(self, value: str, prefix=False):
         value = str(value)
+
+        if (
+            self.cur_role == "assistant"
+            and self.num_api_spec_tokens is not None
+            and self.backend.is_chat_model
+            and not prefix
+        ):
+            self.backend.spec_fill(value)
+            return
+
         if self.speculated_text.startswith(value):
             self.speculated_text = self.speculated_text[len(value) :]
         else:
             self.speculated_text = ""
+
         self.text_ += value
 
     def _execute_image(self, expr: SglImage):
@@ -370,68 +422,93 @@ class StreamExecutor:
         self.cur_images.append((path, base64_data))
         self.text_ += self.chat_template.image_token
 
+    def _execute_video(self, expr: SglVideo):
+        path = expr.path
+        num_frames = expr.num_frames
+
+        base64_data = encode_video_base64(path, num_frames)
+
+        self.images_.append((path, base64_data))
+        self.cur_images.append((path, base64_data))
+        self.text_ += self.chat_template.image_token
+
         # if global_config.eager_fill_image:
         #     self.backend.fill_image(self)
+
+    def _spec_gen(self, sampling_params):
+        stop = sampling_params.stop
+        max_new_tokens = sampling_params.max_new_tokens
+        meta_info = {}
+
+        def regen():
+            nonlocal meta_info
+
+            sampling_params.max_new_tokens = max(
+                sampling_params.max_new_tokens, self.num_api_spec_tokens
+            )
+            sampling_params.stop = None
+            self.speculated_text, meta_info = self.backend.generate(
+                self, sampling_params=sampling_params
+            )
+
+        def find_stop():
+            if isinstance(stop, str):
+                return self.speculated_text.find(stop)
+            elif isinstance(stop, (tuple, list)):
+                pos = -1
+                for stop_str in stop:
+                    stop_pos = self.speculated_text.find(stop_str)
+                    if stop_pos != -1 and (pos == -1 or stop_pos < pos):
+                        pos = stop_pos
+                return pos
+            else:
+                raise Exception("Wrong type of stop in sampling parameters.")
+
+        if stop is None:
+            if len(self.speculated_text) < max_new_tokens:
+                regen()
+            comp = self.speculated_text[:max_new_tokens]
+            self.speculated_text = self.speculated_text[max_new_tokens:]
+        elif isinstance(stop, (str, list, tuple)):
+            if self.speculated_text == "":
+                regen()
+            stop_pos = find_stop()
+            if stop_pos == -1:
+                stop_pos = min(
+                    sampling_params.max_new_tokens,
+                    len(self.speculated_text),
+                )
+            comp = self.speculated_text[:stop_pos]
+            self.speculated_text = self.speculated_text[stop_pos:]
+        else:
+            raise ValueError("Wrong type of stop in sampling parameters.")
+
+        return comp, meta_info
 
     def _execute_gen(self, expr: SglGen):
         sampling_params = self._resolve_sampling_params(expr.sampling_params)
         name = expr.name
 
         if not self.stream:
-            if self.api_num_spec_tokens is not None:
-                stop = sampling_params.stop
-                max_new_tokens = sampling_params.max_new_tokens
-                meta_info = {}
-
-                def regen():
-                    sampling_params.max_new_tokens = max(
-                        sampling_params.max_new_tokens, self.api_num_spec_tokens
-                    )
-                    sampling_params.stop = None
-                    self.speculated_text, meta_info = self.backend.generate(
-                        self, sampling_params=sampling_params
-                    )
-
-                def find_stop():
-                    if isinstance(stop, str):
-                        return self.speculated_text.find(stop), len(stop)
-                    elif isinstance(stop, (tuple, list)):
-                        pos = -1
-                        stop_len = 0
-                        for stop_str in stop:
-                            stop_pos = self.speculated_text.find(stop_str)
-                            if stop_pos != -1 and (pos == -1 or stop_pos < pos):
-                                pos = stop_pos
-                                stop_len = len(stop_str)
-                        return pos, stop_len
-                    else:
-                        raise Exception("Wrong type of stop in sampling parameters.")
-
-                if stop is None:
-                    if len(self.speculated_text) < max_new_tokens:
-                        regen()
-                    comp = self.speculated_text[:max_new_tokens]
-                    self.speculated_text = self.speculated_text[max_new_tokens:]
-                elif isinstance(stop, (str, list, tuple)):
-                    if self.speculated_text == "":
-                        regen()
-                    stop_pos, stop_len = find_stop()
-                    if stop_pos == -1:
-                        stop_pos, stop_len = (
-                            min(
-                                sampling_params.max_new_tokens,
-                                len(self.speculated_text),
-                            ),
-                            0,
-                        )
-                    comp = self.speculated_text[:stop_pos]
-                    self.speculated_text = self.speculated_text[stop_pos:]
-                else:
-                    raise ValueError("Wrong type of stop in sampling parameters.")
-            else:
+            if self.num_api_spec_tokens is None:
                 comp, meta_info = self.backend.generate(
-                    self, sampling_params=sampling_params
+                    self,
+                    sampling_params=sampling_params,
                 )
+            else:
+                if self.backend.is_chat_model:
+                    # Speculative execution on models with only chat interface.
+                    # Store the calls into a temporary list.
+                    # They will be lazily executed later.
+                    comp, meta_info = self.backend.generate(
+                        self,
+                        sampling_params=sampling_params,
+                        spec_var_name=name,
+                    )
+                    return
+
+                else: # Speculative execution on models with completion interface
+                    comp, meta_info = self._spec_gen(sampling_params)
 
             self.text_ += comp
 
@@ -439,6 +516,9 @@ class StreamExecutor:
             self.meta_info[name] = meta_info
             self.variable_event[name].set()
         else:
+            assert (
+                self.num_api_spec_tokens is None
+            ), "stream is not supported with api speculative execution"
             generator = self.backend.generate_stream(
                 self, sampling_params=sampling_params
             )
@@ -494,10 +574,19 @@ class StreamExecutor:
 
         prefix, _ = self.chat_template.get_prefix_and_suffix(expr.role, self.messages_)
 
-        self._execute_fill(prefix)
+        self._execute_fill(prefix, prefix=True)
         self.cur_role_begin_pos = len(self.text_)
 
     def _execute_role_end(self, expr: SglRoleEnd):
+        if (
+            self.cur_role == "assistant"
+            and self.num_api_spec_tokens is not None
+            and self.backend.is_chat_model
+        ):
+            # Execute the stored lazy generation calls
+            self.backend.role_end_generate(self)
+        self.cur_role = None
+
         new_text = self.text_[self.cur_role_begin_pos :].lstrip()
 
         _, suffix = self.chat_template.get_prefix_and_suffix(expr.role, self.messages_)
@@ -523,8 +612,6 @@ class StreamExecutor:
         else:
             # OpenAI chat API format
             self.messages_.append({"role": expr.role, "content": new_text})
-
-        self.cur_role = None
 
     def _execute_var_scope_begin(self, expr: SglVarScopeBegin):
         self.variables[expr.name] = int(len(self.text_))
@@ -641,8 +728,12 @@ class ProgramState:
         yield
         self.stream_executor.submit(SglVarScopeEnd(name))
 
-    def fork(self, number: int = 1, position_ids_offset: Optional[List[int]] = None):
-        stream_executors = self.stream_executor.fork(number, position_ids_offset)
+    def fork(
+        self,
+        size: int = 1,
+        position_ids_offset: Optional[List[int]] = None,
+    ):
+        stream_executors = self.stream_executor.fork(size, position_ids_offset)
         states = [ProgramState(x) for x in stream_executors]
         state_group = ProgramStateGroup(states, self)
         return state_group
@@ -663,6 +754,9 @@ class ProgramState:
 
     def sync(self):
         return self.stream_executor.sync()
+
+    def error(self):
+        return self.stream_executor.error()
 
     def text_iter(self, var_name: Optional[str] = None):
         if self.stream_executor.stream:
@@ -751,6 +845,9 @@ class ProgramState:
 
     def __setitem__(self, name, value):
         self.set_var(name, value)
+
+    def __contains__(self, name):
+        return name in self.stream_executor.variables
 
     def __del__(self):
         self.stream_executor.end()

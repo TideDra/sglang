@@ -1,23 +1,38 @@
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import IntEnum, auto
 from typing import List
 
 import numpy as np
 import torch
+
 from sglang.srt.managers.router.radix_cache import RadixCache
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 
 
-class ForwardMode(Enum):
+class ForwardMode(IntEnum):
     PREFILL = auto()
     EXTEND = auto()
     DECODE = auto()
 
 
-class FinishReason(Enum):
-    LENGTH = auto()
+class FinishReason(IntEnum):
     EOS_TOKEN = auto()
+    LENGTH = auto()
     STOP_STR = auto()
+    ABORT = auto()
+
+    @staticmethod
+    def to_str(reason):
+        if reason == FinishReason.EOS_TOKEN:
+            return None
+        elif reason == FinishReason.LENGTH:
+            return "length"
+        elif reason == FinishReason.STOP_STR:
+            return "stop"
+        elif reason == FinishReason.ABORT:
+            return "abort"
+        else:
+            return None
 
 
 class Req:
@@ -30,6 +45,7 @@ class Req:
         # Since jump forward may retokenize the prompt with partial outputs,
         # we maintain the original prompt length to report the correct usage.
         self.prompt_tokens = len(input_ids)
+
         # The number of decoded tokens for token usage report. Note that
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
@@ -40,12 +56,11 @@ class Req:
         self.image_offset = 0
         self.pad_value = None
 
+        # Sampling parameters
         self.sampling_params = None
-        self.return_logprob = False
-        self.logprob_start_len = 0
-        self.top_logprobs_num = 0
         self.stream = False
 
+        # Check finish
         self.tokenizer = None
         self.finished = False
         self.finish_reason = None
@@ -55,13 +70,17 @@ class Req:
         self.prefix_indices = []
         self.last_node = None
 
+        # Logprobs
+        self.return_logprob = False
+        self.logprob_start_len = 0
+        self.top_logprobs_num = 0
+        self.normalized_prompt_logprob = None
         self.prefill_token_logprobs = None
         self.decode_token_logprobs = None
-        self.normalized_prompt_logprob = None
         self.prefill_top_logprobs = None
         self.decode_top_logprobs = None
 
-        # For constrained decoding
+        # Constrained decoding
         self.regex_fsm = None
         self.regex_fsm_state = 0
         self.jump_forward_map = None
@@ -69,6 +88,35 @@ class Req:
 
     def max_new_tokens(self):
         return self.sampling_params.max_new_tokens
+
+    def check_finished(self):
+        if self.finished:
+            return
+
+        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+            self.finished = True
+            self.finish_reason = FinishReason.LENGTH
+            return
+
+        if (
+            self.output_ids[-1] == self.tokenizer.eos_token_id
+            and self.sampling_params.ignore_eos == False
+        ):
+            self.finished = True
+            self.finish_reason = FinishReason.EOS_TOKEN
+            return
+
+        if len(self.sampling_params.stop_strs) > 0:
+            tail_str = self.tokenizer.decode(
+                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
+            )
+
+            for stop_str in self.sampling_params.stop_strs:
+                if stop_str in tail_str:
+                    self.finished = True
+                    self.finish_reason = FinishReason.STOP_STR
+                    self.hit_stop_str = stop_str
+                    return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
         old_output_str = self.tokenizer.decode(self.output_ids)
@@ -80,6 +128,9 @@ class Req:
         )
         if first_token.startswith("▁"):
             old_output_str = " " + old_output_str
+        if self.input_text is None:
+            # TODO(lmzheng): This can be wrong. Check with Liangsheng.
+            self.input_text = self.tokenizer.decode(self.input_ids)
         new_input_string = (
             self.input_text
             + self.output_and_jump_forward_str
@@ -113,35 +164,6 @@ class Req:
         # print(f"Output and jump forward str:\n{self.output_and_jump_forward_str}")
         # print("*" * 100)
 
-    def check_finished(self):
-        if self.finished:
-            return
-
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished = True
-            self.finish_reason = FinishReason.LENGTH
-            return
-
-        if (
-            self.output_ids[-1] == self.tokenizer.eos_token_id
-            and self.sampling_params.ignore_eos == False
-        ):
-            self.finished = True
-            self.finish_reason = FinishReason.EOS_TOKEN
-            return
-
-        if len(self.sampling_params.stop_strs) > 0:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
-            )
-
-            for stop_str in self.sampling_params.stop_strs:
-                if stop_str in tail_str:
-                    self.finished = True
-                    self.finish_reason = FinishReason.STOP_STR
-                    self.hit_stop_str = stop_str
-                    return
-
     def __repr__(self):
         return f"rid(n={self.rid}, " f"input_ids={self.input_ids}, "
 
@@ -164,8 +186,8 @@ class Batch:
     out_cache_cont_end: torch.Tensor = None
 
     # for processing logprobs
-    top_logprobs_nums: List[int] = None
     return_logprob: bool = False
+    top_logprobs_nums: List[int] = None
 
     # for multimodal
     pixel_values: List[torch.Tensor] = None
@@ -235,12 +257,11 @@ class Batch:
         extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
         if out_cache_loc is None:
-            if not self.tree_cache.disable:
-                self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
-                out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+            self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.dec_refs)
+            out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
 
             if out_cache_loc is None:
-                print("Prefill out of memory. This should nerver happen.")
+                print("Prefill out of memory. This should never happen.")
                 self.tree_cache.pretty_print()
                 exit()
 
@@ -306,8 +327,8 @@ class Batch:
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
-        if not self.tree_cache.disable:
-            self.tree_cache.evict(bs, self.token_to_kv_pool.free)
+        self.tree_cache.evict(bs, self.token_to_kv_pool.dec_refs)
+
         if self.token_to_kv_pool.available_size() >= bs:
             return True
 
@@ -321,26 +342,26 @@ class Batch:
         )
 
         retracted_reqs = []
-        seq_lens_np = self.seq_lens.cpu().numpy()
-        req_pool_indices_np = self.req_pool_indices.cpu().numpy()
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
         while self.token_to_kv_pool.available_size() < len(self.reqs):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
 
-            self.tree_cache.dec_ref_counter(req.last_node)
+            # TODO: apply more fine-grained retraction
+            last_uncached_pos = len(req.prefix_indices)
+            token_indices = self.req_to_token_pool.req_to_token[
+                req_pool_indices_cpu[idx]
+            ][last_uncached_pos : seq_lens_cpu[idx]]
+            self.token_to_kv_pool.dec_refs(token_indices)
+
+            self.tree_cache.dec_lock_ref(req.last_node)
             req.prefix_indices = None
             req.last_node = None
             req.extend_input_len = 0
             req.output_ids = []
             req.regex_fsm_state = 0
-
-            # TODO: apply more fine-grained retraction
-
-            token_indices = self.req_to_token_pool.req_to_token[
-                req_pool_indices_np[idx]
-            ][: seq_lens_np[idx]]
-            self.token_to_kv_pool.free(token_indices)
 
         self.filter_batch(sorted_indices)
 
@@ -360,20 +381,18 @@ class Batch:
                     if len(jump_forward_str) <= 1:
                         continue
 
-                    # insert the old request into tree_cache
-                    token_ids_in_memory = tuple(req.input_ids + req.output_ids)[:-1]
                     if req_pool_indices_cpu is None:
-                        req_pool_indices_cpu = self.req_pool_indices.cpu().tolist()
-                    req_pool_idx = req_pool_indices_cpu[i]
-                    indices = self.req_to_token_pool.req_to_token[
-                        req_pool_idx, : len(token_ids_in_memory)
-                    ]
-                    prefix_len = self.tree_cache.insert(
-                        token_ids_in_memory, indices.clone()
+                        req_pool_indices_cpu = self.req_pool_indices.tolist()
+
+                    # insert the old request into tree_cache
+                    self.tree_cache.cache_req(
+                        token_ids=tuple(req.input_ids + req.output_ids)[:-1],
+                        last_uncached_pos=len(req.prefix_indices),
+                        req_pool_idx=req_pool_indices_cpu[i],
                     )
-                    self.token_to_kv_pool.free(indices[:prefix_len])
-                    self.req_to_token_pool.free(req_pool_idx)
-                    self.tree_cache.dec_ref_counter(req.last_node)
+
+                    # unlock the last node
+                    self.tree_cache.dec_lock_ref(req.last_node)
 
                     # jump-forward
                     req.jump_forward_and_retokenize(jump_forward_str, next_state)
@@ -402,7 +421,7 @@ class Batch:
             self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
 
             if self.out_cache_loc is None:
-                print("Decode out of memory. This should nerver happen.")
+                print("Decode out of memory. This should never happen.")
                 self.tree_cache.pretty_print()
                 exit()
 

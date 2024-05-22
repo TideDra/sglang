@@ -1,8 +1,18 @@
+"""pydantic models for OpenAI API protocol"""
+
 import time
 from typing import Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 from typing_extensions import Literal
+
+
+class ErrorResponse(BaseModel):
+    object: str = "error"
+    message: str
+    type: str
+    param: Optional[str] = None
+    code: int
 
 
 class LogProbs(BaseModel):
@@ -19,21 +29,24 @@ class UsageInfo(BaseModel):
 
 
 class CompletionRequest(BaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/completions/create
     model: str
-    prompt: Union[str, List[str]]
-    suffix: Optional[str] = None
-    max_tokens: Optional[int] = 16
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
-    n: Optional[int] = 1
-    stream: Optional[bool] = False
-    logprobs: Optional[int] = None
-    echo: Optional[bool] = False
-    stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
-    presence_penalty: Optional[float] = 0.0
-    frequency_penalty: Optional[float] = 0.0
+    prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
+    echo: Optional[bool] = False
+    frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
+    logprobs: Optional[int] = None
+    max_tokens: Optional[int] = 16
+    n: int = 1
+    presence_penalty: Optional[float] = 0.0
+    seed: Optional[int] = None
+    stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
+    stream: Optional[bool] = False
+    suffix: Optional[str] = None
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 1.0
     user: Optional[str] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -107,20 +120,30 @@ ChatCompletionMessageParam = Union[
 ]
 
 
+class ResponseFormat(BaseModel):
+    # type must be "json_object" or "text"
+    type: Literal["text", "json_object"]
+
+
 class ChatCompletionRequest(BaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/chat/create
+    messages: List[ChatCompletionMessageParam]
     model: str
-    messages: Union[str, List[ChatCompletionMessageParam]]
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
-    n: Optional[int] = 1
-    max_tokens: Optional[int] = 16
-    stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
-    stream: Optional[bool] = False
-    presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
+    logprobs: Optional[bool] = False
+    top_logprobs: Optional[int] = None
+    max_tokens: Optional[int] = None
+    n: Optional[int] = 1
+    presence_penalty: Optional[float] = 0.0
+    response_format: Optional[ResponseFormat] = None
+    seed: Optional[int] = None
+    stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
+    stream: Optional[bool] = False
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 1.0
     user: Optional[str] = None
-    best_of: Optional[int] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
@@ -134,6 +157,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
+    logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
 
 
@@ -154,6 +178,7 @@ class DeltaMessage(BaseModel):
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
+    logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
 
 

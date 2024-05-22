@@ -162,18 +162,25 @@ register_chat_template(
     )
 )
 
-
 register_chat_template(
     ChatTemplate(
-        name="llama-2-chat-llava",
+        name="llama-3-instruct",
         default_system_prompt=None,
         role_prefix_and_suffix={
-            "system": ("<<SYS>>\n", "\n<</SYS>>\n\n"),
-            "user": ("[INST] ", " [/INST]"),
-            "assistant": ("", " </s><s>"),
+            "system": (
+                "<|start_header_id|>system<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+            "user": (
+                "<|start_header_id|>user<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
+            "assistant": (
+                "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                "<|eot_id|>",
+            ),
         },
-        style=ChatTemplateStyle.LLAMA2,
-        image_token=" <image>\n",
+        stop_str=("<|eot_id|>",),
     )
 )
 
@@ -220,6 +227,25 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="c4ai-command-r",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>",
+                "<|END_OF_TURN_TOKEN|>",
+            ),
+            "user": ("<|START_OF_TURN_TOKEN|><|USER_TOKEN|>", "<|END_OF_TURN_TOKEN|>"),
+            "assistant": (
+                "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
+                "<|END_OF_TURN_TOKEN|>",
+            ),
+        },
+        style=ChatTemplateStyle.PLAIN,
+    )
+)
+
 
 @register_chat_template_matching_function
 def match_dbrx(model_path: str):
@@ -234,6 +260,8 @@ def match_vicuna(model_path: str):
     if "llava-v1.5" in model_path.lower():
         return get_chat_template("vicuna_v1.1")
     if "llava-1.5" in model_path.lower():
+        return get_chat_template("vicuna_v1.1")
+    if "llava-next-video-7b" in model_path.lower():
         return get_chat_template("vicuna_v1.1")
 
 
@@ -253,13 +281,25 @@ def match_llama2_chat(model_path: str):
 
 
 @register_chat_template_matching_function
+def match_llama3_instruct(model_path: str):
+    model_path = model_path.lower()
+    if "llama-3" in model_path and "instruct" in model_path:
+        return get_chat_template("llama-3-instruct")
+
+
+@register_chat_template_matching_function
 def match_chat_ml(model_path: str):
+    # import pdb;pdb.set_trace()
     model_path = model_path.lower()
     if "tinyllama" in model_path:
         return get_chat_template("chatml")
     if "qwen" in model_path and "chat" in model_path:
         return get_chat_template("chatml")
-    if "llava-v1.6-34b" in model_path:
+    if (
+        "llava-v1.6-34b" in model_path
+        or "llava-v1.6-yi-34b" in model_path
+        or "llava-next-video-34b" in model_path
+    ):
         return get_chat_template("chatml-llava")
     if "nous-hermes-2" in model_path:
         return get_chat_template("chatml")
@@ -268,7 +308,7 @@ def match_chat_ml(model_path: str):
 @register_chat_template_matching_function
 def match_chat_yi(model_path: str):
     model_path = model_path.lower()
-    if "yi" in model_path:
+    if "yi" in model_path and "llava" not in model_path:
         return get_chat_template("yi")
 
 
@@ -277,6 +317,13 @@ def match_gemma_it(model_path: str):
     model_path = model_path.lower()
     if "gemma" in model_path and "it" in model_path:
         return get_chat_template("gemma-it")
+
+
+@register_chat_template_matching_function
+def match_c4ai_command_r(model_path: str):
+    model_path = model_path.lower()
+    if "c4ai-command-r" in model_path:
+        return get_chat_template("c4ai-command-r")
 
 
 if __name__ == "__main__":

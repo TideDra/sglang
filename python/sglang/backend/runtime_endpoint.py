@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Union
 
 import numpy as np
 import requests
+
 from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
 from sglang.lang.chat_template import get_chat_template_by_model_path
@@ -33,7 +34,7 @@ class RuntimeEndpoint(BaseBackend):
             api_key=self.api_key,
             verify=self.verify,
         )
-        assert res.status_code == 200
+        self._assert_success(res)
         self.model_info = res.json()
 
         self.chat_template = get_chat_template_by_model_path(
@@ -49,7 +50,7 @@ class RuntimeEndpoint(BaseBackend):
             auth_token=self.auth_token,
             verify=self.verify,
         )
-        return res.status_code == 200
+        self._assert_success(res)
 
     def get_server_args(self):
         res = http_request(
@@ -57,6 +58,7 @@ class RuntimeEndpoint(BaseBackend):
             auth_token=self.auth_token,
             verify=self.verify,
         )
+        self._assert_success(res)
         return res.json()
 
     def get_chat_template(self):
@@ -70,7 +72,7 @@ class RuntimeEndpoint(BaseBackend):
             api_key=self.api_key,
             verify=self.verify,
         )
-        assert res.status_code == 200
+        self._assert_success(res)
 
     def commit_lazy_operations(self, s: StreamExecutor):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
@@ -82,7 +84,7 @@ class RuntimeEndpoint(BaseBackend):
             api_key=self.api_key,
             verify=self.verify,
         )
-        assert res.status_code == 200
+        self._assert_success(res)
 
     def fill_image(self, s: StreamExecutor):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
@@ -94,7 +96,7 @@ class RuntimeEndpoint(BaseBackend):
             api_key=self.api_key,
             verify=self.verify,
         )
-        assert res.status_code == 200
+        self._assert_success(res)
 
     def generate(
         self,
@@ -106,6 +108,7 @@ class RuntimeEndpoint(BaseBackend):
                 "text": s.text_,
                 "sampling_params": {
                     "skip_special_tokens": global_config.skip_special_tokens_in_output,
+                    "spaces_between_special_tokens": global_config.spaces_between_special_tokens_in_out,
                     **sampling_params.to_srt_kwargs(),
                 },
             }
@@ -114,6 +117,7 @@ class RuntimeEndpoint(BaseBackend):
                 "text": s.text_,
                 "sampling_params": {
                     "skip_special_tokens": global_config.skip_special_tokens_in_output,
+                    "spaces_between_special_tokens": global_config.spaces_between_special_tokens_in_out,
                     "dtype": "int",
                     **sampling_params.to_srt_kwargs(),
                 },
@@ -130,6 +134,8 @@ class RuntimeEndpoint(BaseBackend):
             api_key=self.api_key,
             verify=self.verify,
         )
+        self._assert_success(res)
+
         obj = res.json()
         comp = obj["text"]
         return comp, obj["meta_info"]
@@ -144,6 +150,7 @@ class RuntimeEndpoint(BaseBackend):
                 "text": s.text_,
                 "sampling_params": {
                     "skip_special_tokens": global_config.skip_special_tokens_in_output,
+                    "spaces_between_special_tokens": global_config.spaces_between_special_tokens_in_out,
                     **sampling_params.to_srt_kwargs(),
                 },
             }
@@ -152,6 +159,7 @@ class RuntimeEndpoint(BaseBackend):
                 "text": s.text_,
                 "sampling_params": {
                     "skip_special_tokens": global_config.skip_special_tokens_in_output,
+                    "spaces_between_special_tokens": global_config.spaces_between_special_tokens_in_out,
                     "dtype": "int",
                     **sampling_params.to_srt_kwargs(),
                 },
@@ -162,7 +170,7 @@ class RuntimeEndpoint(BaseBackend):
         data["stream"] = True
         self._add_images(s, data)
 
-        response = http_request(
+        res = http_request(
             self.base_url + "/generate",
             json=data,
             stream=True,
@@ -170,10 +178,11 @@ class RuntimeEndpoint(BaseBackend):
             api_key=self.api_key,
             verify=self.verify,
         )
+        self._assert_success(res)
         pos = 0
 
         incomplete_text = ""
-        for chunk in response.iter_lines(decode_unicode=False):
+        for chunk in res.iter_lines(decode_unicode=False):
             chunk = chunk.decode("utf-8")
             if chunk and chunk.startswith("data:"):
                 if chunk == "data: [DONE]":
@@ -206,7 +215,7 @@ class RuntimeEndpoint(BaseBackend):
             api_key=self.api_key,
             verify=self.verify,
         )
-        assert res.status_code == 200
+        self._assert_success(res)
         prompt_len = res.json()["meta_info"]["prompt_tokens"]
 
         # Compute logprob
@@ -215,7 +224,6 @@ class RuntimeEndpoint(BaseBackend):
             "sampling_params": {"max_new_tokens": 0},
             "return_logprob": True,
             "logprob_start_len": max(prompt_len - 2, 0),
-            "return_text_in_logprobs": True,
         }
         self._add_images(s, data)
         res = http_request(
@@ -225,7 +233,7 @@ class RuntimeEndpoint(BaseBackend):
             api_key=self.api_key,
             verify=self.verify,
         )
-        assert res.status_code == 200
+        self._assert_success(res)
         obj = res.json()
         normalized_prompt_logprobs = [
             r["meta_info"]["normalized_prompt_logprob"] for r in obj
@@ -249,9 +257,13 @@ class RuntimeEndpoint(BaseBackend):
             api_key=self.api_key,
             verify=self.verify,
         )
-        assert res.status_code == 200
+        self._assert_success(res)
 
     def _add_images(self, s: StreamExecutor, data):
         if s.images_:
             assert len(s.images_) == 1, "Only support one image."
             data["image_data"] = s.images_[0][1]
+
+    def _assert_success(self, res):
+        if res.status_code != 200:
+            raise RuntimeError(res.json())

@@ -226,7 +226,7 @@ Action 3: Finish [United States].\n
 
 def test_parallel_decoding():
     max_tokens = 64
-    number = 5
+    fork_size = 5
 
     @sgl.function
     def parallel_decoding(s, topic):
@@ -234,17 +234,17 @@ def test_parallel_decoding():
         s += "USER: Give some tips for " + topic + ".\n"
         s += (
             "ASSISTANT: Okay. Here are "
-            + str(number)
+            + str(fork_size)
             + " concise tips, each under 8 words:\n"
         )
 
         # Generate skeleton
-        for i in range(1, 1 + number):
+        for i in range(1, 1 + fork_size):
             s += f"{i}." + sgl.gen(max_tokens=16, stop=[".", "\n"]) + ".\n"
 
         # Generate detailed tips
-        forks = s.fork(number)
-        for i in range(number):
+        forks = s.fork(fork_size)
+        for i in range(fork_size):
             forks[
                 i
             ] += f"Now, I expand tip {i+1} into a detailed paragraph:\nTip {i+1}:"
@@ -253,7 +253,7 @@ def test_parallel_decoding():
 
         # Concatenate tips and summarize
         s += "Here are these tips with detailed explanation:\n"
-        for i in range(number):
+        for i in range(fork_size):
             s += f"Tip {i+1}:" + forks[i]["detailed_tip"] + "\n"
 
         s += "\nIn summary," + sgl.gen("summary", max_tokens=512)
@@ -296,7 +296,7 @@ def test_parallel_encoding(check_answer=True):
 def test_image_qa():
     @sgl.function
     def image_qa(s, question):
-        s += sgl.user(sgl.image("test_image.png") + question)
+        s += sgl.user(sgl.image("example_image.png") + question)
         s += sgl.assistant(sgl.gen("answer"))
 
     state = image_qa.run(
@@ -304,6 +304,7 @@ def test_image_qa():
         temperature=0,
         max_new_tokens=64,
     )
+
     assert (
         "taxi" in state.messages()[-1]["content"]
         or "car" in state.messages()[-1]["content"]
@@ -313,6 +314,7 @@ def test_image_qa():
 def test_stream():
     @sgl.function
     def qa(s, question):
+        s += sgl.system("You are a helpful assistant.")
         s += sgl.user(question)
         s += sgl.assistant(sgl.gen("answer"))
 
@@ -348,3 +350,46 @@ def test_regex():
     state = regex_gen.run()
     answer = state["answer"]
     assert re.match(regex, answer)
+
+
+def test_completion_speculative():
+    @sgl.function(num_api_spec_tokens=64)
+    def gen_character_spec(s):
+        s += "Construct a character within the following format:\n"
+        s += "Name: Steve Jobs.\nBirthday: February 24, 1955.\nJob: Apple CEO.\n"
+        s += "\nPlease generate new Name, Birthday and Job.\n"
+        s += "Name:" + sgl.gen("name", stop="\n") + "\nBirthday:" + sgl.gen("birthday", stop="\n")
+        s += "\nJob:" + sgl.gen("job", stop="\n") + "\n"
+
+
+    @sgl.function
+    def gen_character_no_spec(s):
+        s += "Construct a character within the following format:\n"
+        s += "Name: Steve Jobs.\nBirthday: February 24, 1955.\nJob: Apple CEO.\n"
+        s += "\nPlease generate new Name, Birthday and Job.\n"
+        s += "Name:" + sgl.gen("name", stop="\n") + "\nBirthday:" + sgl.gen("birthday", stop="\n")
+        s += "\nJob:" + sgl.gen("job", stop="\n") + "\n"
+
+    token_usage = sgl.global_config.default_backend.token_usage
+
+    token_usage.reset()
+    gen_character_spec().sync()
+    usage_with_spec = token_usage.prompt_tokens
+
+    token_usage.reset()
+    gen_character_no_spec().sync()
+    usage_with_no_spec = token_usage.prompt_tokens
+
+    assert usage_with_spec < usage_with_no_spec, f"{usage_with_spec} vs {usage_with_no_spec}"
+
+
+def test_chat_completion_speculative():
+    @sgl.function(num_api_spec_tokens=256)
+    def gen_character_spec(s):
+        s += sgl.system("You are a helpful assistant.")
+        s += sgl.user("Construct a character within the following format:")
+        s += sgl.assistant("Name: Steve Jobs.\nBirthday: February 24, 1955.\nJob: Apple CEO.\n")
+        s += sgl.user("Please generate new Name, Birthday and Job.\n")
+        s += sgl.assistant("Name:" + sgl.gen("name", stop="\n") + "\nBirthday:" + sgl.gen("birthday", stop="\n") + "\nJob:" + sgl.gen("job", stop="\n"))
+
+    gen_character_spec().sync()

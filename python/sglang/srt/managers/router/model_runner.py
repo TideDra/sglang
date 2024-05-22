@@ -1,64 +1,30 @@
 import importlib
 import importlib.resources
-import inspect
 import logging
 import pkgutil
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List
+from typing import List, Optional, Type
 
 import numpy as np
 import torch
+import torch.nn as nn
+from vllm.config import DeviceConfig, LoadConfig
+from vllm.config import ModelConfig as VllmModelConfig
+from vllm.distributed import initialize_model_parallel
+from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models import ModelRegistry
+
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
-from sglang.srt.utils import is_multimodal_model
-from sglang.utils import get_available_gpu_memory
-from vllm.model_executor.layers.quantization.awq import AWQConfig
-from vllm.model_executor.layers.quantization.gptq import GPTQConfig
-from vllm.model_executor.layers.quantization.marlin import MarlinConfig
-from vllm.model_executor.model_loader import _set_default_torch_dtype
-from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_available_gpu_memory, is_multimodal_model
 
-QUANTIZATION_CONFIG_MAPPING = {
-    "awq": AWQConfig,
-    "gptq": GPTQConfig,
-    "marlin": MarlinConfig,
-}
 
 logger = logging.getLogger("model_runner")
 
-
 # for server args in model endpoints
-global_server_args_dict: dict = None
-
-
-@lru_cache()
-def import_model_classes():
-    model_arch_name_to_cls = {}
-    package_name = "sglang.srt.models"
-    package = importlib.import_module(package_name)
-    for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
-        if not ispkg:
-            module = importlib.import_module(name)
-            if hasattr(module, "EntryClass"):
-                model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
-    return model_arch_name_to_cls
-
-
-def get_model_cls_by_arch_name(model_arch_names):
-    model_arch_name_to_cls = import_model_classes()
-
-    model_class = None
-    for arch in model_arch_names:
-        if arch in model_arch_name_to_cls:
-            model_class = model_arch_name_to_cls[arch]
-            break
-    else:
-        raise ValueError(
-            f"Unsupported architectures: {arch}. "
-            f"Supported list: {list(model_arch_name_to_cls.keys())}"
-        )
-    return model_class
+global_server_args_dict = {}
 
 
 @dataclass
@@ -86,8 +52,8 @@ class InputMetadata:
     out_cache_cont_end: torch.Tensor = None
 
     other_kv_index: torch.Tensor = None
-    top_logprobs_nums: List[int] = None
     return_logprob: bool = False
+    top_logprobs_nums: List[int] = None
 
     # for flashinfer
     qo_indptr: torch.Tensor = None
@@ -107,18 +73,20 @@ class InputMetadata:
             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
         )
         self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        self.kv_last_page_len = torch.ones(
+            (self.batch_size,), dtype=torch.int32, device="cuda"
+        )
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
         self.kv_indices = torch.cat(
             [
                 self.req_to_token_pool.req_to_token[
-                    self.req_pool_indices[i].item(), : self.seq_lens[i].item()
+                    req_pool_indices_cpu[i], : seq_lens_cpu[i]
                 ]
                 for i in range(self.batch_size)
             ],
             dim=0,
         ).contiguous()
-        self.kv_last_page_len = torch.ones(
-            (self.batch_size,), dtype=torch.int32, device="cuda"
-        )
 
         workspace_buffer = torch.empty(
             32 * 1024 * 1024, dtype=torch.int8, device="cuda"
@@ -141,15 +109,8 @@ class InputMetadata:
                 self.kv_last_page_len,
                 self.model_runner.model_config.num_attention_heads // tp_size,
                 self.model_runner.model_config.num_key_value_heads // tp_size,
+                self.model_runner.model_config.head_dim,
             ]
-
-            # flashinfer >= 0.0.3
-            # FIXME: Drop this when flashinfer updates to 0.0.4
-            if (
-                len(inspect.signature(self.prefill_wrapper.begin_forward).parameters)
-                == 7
-            ):
-                args.append(self.model_runner.model_config.head_dim)
 
             self.prefill_wrapper.begin_forward(*args)
         else:
@@ -202,15 +163,15 @@ class InputMetadata:
                 req_pool_indices[0], seq_lens[0] - 1
             ].item()
         else:
-            seq_lens_np = seq_lens.cpu().numpy()
-            prefix_lens_np = prefix_lens.cpu().numpy()
-            position_ids_offsets_np = position_ids_offsets.cpu().numpy()
+            seq_lens_cpu = seq_lens.cpu().numpy()
+            prefix_lens_cpu = prefix_lens.cpu().numpy()
+            position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
             positions = torch.tensor(
                 np.concatenate(
                     [
                         np.arange(
-                            prefix_lens_np[i] + position_ids_offsets_np[i],
-                            seq_lens_np[i] + position_ids_offsets_np[i],
+                            prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
+                            seq_lens_cpu[i] + position_ids_offsets_cpu[i],
                         )
                         for i in range(batch_size)
                     ],
@@ -236,9 +197,9 @@ class InputMetadata:
             out_cache_loc=out_cache_loc,
             out_cache_cont_start=out_cache_cont_start,
             out_cache_cont_end=out_cache_cont_end,
-            top_logprobs_nums=top_logprobs_nums,
-            return_logprob=return_logprob,
             other_kv_index=other_kv_index,
+            return_logprob=return_logprob,
+            top_logprobs_nums=top_logprobs_nums,
         )
 
         if forward_mode == ForwardMode.EXTEND:
@@ -258,22 +219,23 @@ class ModelRunner:
         tp_rank,
         tp_size,
         nccl_port,
-        load_format="auto",
-        trust_remote_code=True,
-        server_args_dict: dict = {},
+        server_args: ServerArgs,
     ):
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.nccl_port = nccl_port
-        self.load_format = load_format
-        self.trust_remote_code = trust_remote_code
+        self.server_args = server_args
 
         global global_server_args_dict
-        global_server_args_dict = server_args_dict
+        global_server_args_dict = {
+            "enable_flashinfer": server_args.enable_flashinfer,
+            "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
+        }
 
         # Init torch distributed
+        logger.debug("Init torch begin.")
         torch.cuda.set_device(self.tp_rank)
         torch.distributed.init_process_group(
             backend="nccl",
@@ -281,66 +243,47 @@ class ModelRunner:
             rank=self.tp_rank,
             init_method=f"tcp://127.0.0.1:{self.nccl_port}",
         )
-
-        # A small all_reduce for warmup.
-        if self.tp_size > 1:
-            torch.distributed.all_reduce(torch.zeros(1).cuda())
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+        logger.debug("Init torch end.")
 
         total_gpu_memory = get_available_gpu_memory(
             self.tp_rank, distributed=self.tp_size > 1
         ) * (1 << 30)
+        # logger.info(f"Before: {get_available_gpu_memory(self.tp_rank, False):.2f} GB")
         self.load_model()
+        # logger.info(f"After: {get_available_gpu_memory(self.tp_rank, False):.2f} GB")
         self.init_memory_pool(total_gpu_memory)
 
         self.is_multimodal_model = is_multimodal_model(self.model_config)
 
     def load_model(self):
-        """See also vllm/model_executor/model_loader.py::get_model"""
-        # Select model class
-        architectures = getattr(self.model_config.hf_config, "architectures", [])
-        model_class = get_model_cls_by_arch_name(architectures)
         logger.info(f"Rank {self.tp_rank}: load weight begin.")
 
-        # Load weights
-        linear_method = None
+        device_config = DeviceConfig()
+        load_config = LoadConfig(load_format=self.server_args.load_format)
+        vllm_model_config = VllmModelConfig(
+            model=self.server_args.model_path,
+            quantization=self.server_args.quantization,
+            tokenizer=None,
+            tokenizer_mode=None,
+            trust_remote_code=self.server_args.trust_remote_code,
+            dtype=torch.float16,
+            seed=42,
+            skip_tokenizer_init=True,
+        )
+        if self.model_config.model_overide_args is not None:
+            vllm_model_config.hf_config.update(self.model_config.model_overide_args)
 
-        quant_cfg = getattr(self.model_config.hf_config, "quantization_config", None)
-        if quant_cfg is not None:
-            quant_method = quant_cfg.get("quant_method", "").lower()
-            # compat: autogptq >=0.8.0 use checkpoint_format: str
-            # compat: autogptq <=0.7.1 is_marlin_format: bool
-            is_format_marlin = quant_cfg.get(
-                "checkpoint_format"
-            ) == "marlin" or quant_cfg.get("is_marlin_format", False)
-
-            # Use marlin if the GPTQ model is serialized in marlin format.
-            if quant_method == "gptq" and is_format_marlin:
-                quant_method = "marlin"
-
-            quant_config_class = QUANTIZATION_CONFIG_MAPPING.get(quant_method)
-
-            if quant_config_class is None:
-                raise ValueError(f"Unsupported quantization method: {quant_method}")
-
-            quant_config = quant_config_class.from_config(quant_cfg)
-            logger.info(f"quant_config: {quant_config}")
-            linear_method = quant_config.get_linear_method()
-
-        with _set_default_torch_dtype(torch.float16):
-            with torch.device("cuda"):
-                model = model_class(
-                    config=self.model_config.hf_config, linear_method=linear_method
-                )
-            model.load_weights(
-                self.model_config.path,
-                cache_dir=None,
-                load_format=self.load_format,
-                revision=None,
-            )
-        self.model = model.eval()
-
-        logger.info(f"Rank {self.tp_rank}: load weight end.")
+        self.model = get_model(
+            model_config=vllm_model_config,
+            device_config=device_config,
+            load_config=load_config,
+            lora_config=None,
+            vision_language_config=None,
+            parallel_config=None,
+            scheduler_config=None,
+        )
+        logger.info(f"Rank {self.tp_rank}: load weight end. {type(self.model)}")
 
     def profile_max_num_token(self, total_gpu_memory):
         available_gpu_memory = get_available_gpu_memory(
@@ -465,3 +408,30 @@ class ModelRunner:
             return self.forward_prefill(batch)
         else:
             raise ValueError(f"Invaid forward mode: {forward_mode}")
+
+
+@lru_cache()
+def import_model_classes():
+    model_arch_name_to_cls = {}
+    package_name = "sglang.srt.models"
+    package = importlib.import_module(package_name)
+    for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
+        if not ispkg:
+            module = importlib.import_module(name)
+            if hasattr(module, "EntryClass"):
+                model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
+    return model_arch_name_to_cls
+
+
+def load_model_cls_srt(model_arch: str) -> Optional[Type[nn.Module]]:
+    model_arch_name_to_cls = import_model_classes()
+    if model_arch not in model_arch_name_to_cls:
+        raise ValueError(
+            f"Unsupported architectures: {model_arch}. "
+            f"Supported list: {list(model_arch_name_to_cls.keys())}"
+        )
+    return model_arch_name_to_cls[model_arch]
+
+
+# Monkey patch model loader
+setattr(ModelRegistry, "load_model_cls", load_model_cls_srt)
