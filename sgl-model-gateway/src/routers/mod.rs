@@ -195,6 +195,20 @@ pub trait RouterTrait: Send + Sync + Debug {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
     }
 
+    /// Get a trajectory by id
+    async fn get_trajectory(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _traj_id: &str,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Trajectory not implemented").into_response()
+    }
+
+    /// Delete a trajectory by id
+    async fn delete_trajectory(&self, _headers: Option<&HeaderMap>, _traj_id: &str) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Trajectory delete not implemented").into_response()
+    }
+
     /// Get router type name
     fn router_type(&self) -> &'static str;
 

@@ -132,6 +132,7 @@ impl ChatResponseProcessingStage {
                 tokenizer,
                 stop_decoder,
                 request_logprobs,
+                ctx.components.clone(),
             )
             .await?;
 
