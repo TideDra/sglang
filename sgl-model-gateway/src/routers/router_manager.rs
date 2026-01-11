@@ -723,6 +723,32 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn get_trajectory(&self, headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.get_trajectory(headers, traj_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("No router available to get trajectory '{}'", traj_id),
+            )
+                .into_response()
+        }
+    }
+
+    async fn delete_trajectory(&self, headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.delete_trajectory(headers, traj_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("No router available to delete trajectory '{}'", traj_id),
+            )
+                .into_response()
+        }
+    }
+
     fn router_type(&self) -> &'static str {
         "manager"
     }
