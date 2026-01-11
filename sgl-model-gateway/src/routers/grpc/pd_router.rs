@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
+use dashmap::DashMap;
 use tracing::debug;
 
 use super::{context::SharedComponents, pipeline::RequestPipeline};
@@ -49,6 +50,7 @@ impl GrpcPDRouter {
             tokenizer_registry: tokenizer_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
+            trajectory_map: DashMap::new(),
         });
 
         // Create PD pipeline

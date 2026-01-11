@@ -359,6 +359,10 @@ pub struct ChatCompletionRequest {
     /// Random seed for sampling for deterministic outputs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_seed: Option<u64>,
+
+    /// Trajectory ID for tracking incremental tokenization
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traj_id: Option<String>,
 }
 
 // ============================================================================
@@ -559,6 +563,41 @@ fn validate_chat_cross_parameters(
         }
     }
 
+    // 8. Validate traj_id compatibility
+    if req.traj_id.is_some() {
+        if req.continue_final_message {
+            let mut e = validator::ValidationError::new("traj_id_and_continue_final_message");
+            e.message = Some("traj_id and continue_final_message cannot be used together".into());
+            return Err(e);
+        }
+        if req.stream {
+            let mut e = validator::ValidationError::new("traj_id_and_stream");
+            e.message = Some("traj_id and stream cannot be used together".into());
+            return Err(e);
+        }
+        if req.stop.is_some() {
+            let mut e = validator::ValidationError::new("traj_id_and_stop");
+            e.message = Some("traj_id and stop cannot be used together".into());
+            return Err(e);
+        }
+        if req.stop_token_ids.is_some() {
+            let mut e = validator::ValidationError::new("traj_id_and_stop_token_ids");
+            e.message = Some("traj_id and stop_token_ids cannot be used together".into());
+            return Err(e);
+        }
+        if req.n.is_some() && req.n.unwrap() != 1 {
+            let mut e = validator::ValidationError::new("traj_id_and_n");
+            e.message = Some("traj_id and n cannot be used together".into());
+            return Err(e);
+        }
+        if req.max_completion_tokens.is_some() {
+            // Currently, we assume a generation request always stops at EOS token.
+            let mut e = validator::ValidationError::new("traj_id_and_max_completion_tokens");
+            e.message = Some("traj_id and max_completion_tokens cannot be used together".into());
+            return Err(e);
+        }
+    }
+
     Ok(())
 }
 
@@ -629,6 +668,64 @@ impl Normalizable for ChatCompletionRequest {
 // GenerationRequest Trait Implementation
 // ============================================================================
 
+pub fn extract_text_from_messages(messages: &[ChatMessage]) -> String {
+    // Use a single buffer to avoid intermediate Vec<String> allocations
+    let mut buffer = String::new();
+    let mut has_content = false;
+
+    for msg in messages {
+        match msg {
+            ChatMessage::System { content, .. }
+            | ChatMessage::User { content, .. }
+            | ChatMessage::Tool { content, .. }
+            | ChatMessage::Developer { content, .. } => {
+                if has_content && content.has_text() {
+                    buffer.push(' ');
+                }
+                if content.append_text_to(&mut buffer) {
+                    has_content = true;
+                }
+            }
+            ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                ..
+            } => {
+                // Append main content
+                if let Some(c) = content {
+                    if has_content && c.has_text() {
+                        buffer.push(' ');
+                    }
+                    if c.append_text_to(&mut buffer) {
+                        has_content = true;
+                    }
+                }
+                // Append reasoning content
+                if let Some(reasoning) = reasoning_content {
+                    if !reasoning.is_empty() {
+                        if has_content {
+                            buffer.push(' ');
+                        }
+                        buffer.push_str(reasoning);
+                        has_content = true;
+                    }
+                }
+            }
+            ChatMessage::Function { content, .. } => {
+                if !content.is_empty() {
+                    if has_content {
+                        buffer.push(' ');
+                    }
+                    buffer.push_str(content);
+                    has_content = true;
+                }
+            }
+        }
+    }
+
+    buffer
+}
+
 impl GenerationRequest for ChatCompletionRequest {
     fn is_stream(&self) -> bool {
         self.stream
@@ -640,61 +737,7 @@ impl GenerationRequest for ChatCompletionRequest {
 
     fn extract_text_for_routing(&self) -> String {
         // Extract text from messages for routing decisions
-        // Use a single buffer to avoid intermediate Vec<String> allocations
-        let mut buffer = String::new();
-        let mut has_content = false;
-
-        for msg in &self.messages {
-            match msg {
-                ChatMessage::System { content, .. }
-                | ChatMessage::User { content, .. }
-                | ChatMessage::Tool { content, .. }
-                | ChatMessage::Developer { content, .. } => {
-                    if has_content && content.has_text() {
-                        buffer.push(' ');
-                    }
-                    if content.append_text_to(&mut buffer) {
-                        has_content = true;
-                    }
-                }
-                ChatMessage::Assistant {
-                    content,
-                    reasoning_content,
-                    ..
-                } => {
-                    // Append main content
-                    if let Some(c) = content {
-                        if has_content && c.has_text() {
-                            buffer.push(' ');
-                        }
-                        if c.append_text_to(&mut buffer) {
-                            has_content = true;
-                        }
-                    }
-                    // Append reasoning content
-                    if let Some(reasoning) = reasoning_content {
-                        if !reasoning.is_empty() {
-                            if has_content {
-                                buffer.push(' ');
-                            }
-                            buffer.push_str(reasoning);
-                            has_content = true;
-                        }
-                    }
-                }
-                ChatMessage::Function { content, .. } => {
-                    if !content.is_empty() {
-                        if has_content {
-                            buffer.push(' ');
-                        }
-                        buffer.push_str(content);
-                        has_content = true;
-                    }
-                }
-            }
-        }
-
-        buffer
+        extract_text_from_messages(&self.messages)
     }
 }
 
@@ -796,4 +839,13 @@ pub struct ChatStreamChoice {
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_stop: Option<Value>,
+}
+
+
+
+#[derive(Default, Serialize)]
+pub struct Trajectory {
+    pub cached_token_ids: Vec<u32>,
+    pub cached_request: ChatCompletionRequest,
+    pub output_token_mask: Vec<u8>,
 }

@@ -399,6 +399,7 @@ pub fn filter_chat_request_by_tool_choice(
 pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
+    add_generation_prompt: bool,
 ) -> Result<ProcessedMessages, String> {
     // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
     // First try direct downcast, then try via CachedTokenizer wrapper
@@ -464,7 +465,7 @@ pub fn process_chat_messages(
         };
 
         let params = ChatTemplateParams {
-            add_generation_prompt: true,
+            add_generation_prompt,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             ..Default::default()
