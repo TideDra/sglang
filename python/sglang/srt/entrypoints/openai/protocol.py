@@ -545,6 +545,9 @@ class ChatCompletionRequest(BaseModel):
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # For trajectory tracking
+    traj_id: Optional[str] = None
+
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -1245,3 +1248,11 @@ class ResponseReasoningTextContent(BaseModel):
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
 ]
+
+
+class Trajectory(BaseModel):
+    cached_token_ids: List[int]
+    output_token_mask: List[int]
+    cached_request: ChatCompletionRequest
+    cached_tools_text: str
+    eos_token_id: int

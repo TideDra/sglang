@@ -1205,6 +1205,18 @@ async def openai_v1_chat_completions(
     )
 
 
+@app.get("/trajectory/{traj_id}")
+async def get_trajectory(traj_id: str, raw_request: Request):
+    """Get a trajectory by ID."""
+    return await raw_request.app.state.openai_serving_chat.get_trajectory(traj_id)
+
+
+@app.delete("/trajectory/{traj_id}")
+async def delete_trajectory(traj_id: str, raw_request: Request):
+    """Delete a trajectory by ID."""
+    return await raw_request.app.state.openai_serving_chat.delete_trajectory(traj_id)
+
+
 @app.post(
     "/v1/embeddings",
     response_class=ORJSONResponse,
