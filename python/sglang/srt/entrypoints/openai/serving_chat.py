@@ -15,6 +15,7 @@ from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageGenericParam,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -32,6 +33,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
+    Trajectory,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -85,6 +87,8 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+
+        self.traj_map: dict[str, Trajectory] = {}
 
     def _use_dpsk_v32_encoding(self) -> bool:
         has_chat_template = (
@@ -143,7 +147,20 @@ class OpenAIServingChat(OpenAIServingBase):
             schema = getattr(request.response_format.json_schema, "schema_", None)
             if schema is None:
                 return "schema_ is required for json_schema response format request."
-
+        if request.traj_id:
+            if request.continue_final_message:
+                return "continue_final_message is not supported when using trajectory tracking"
+            if request.stream:
+                return "stream is not supported when using trajectory tracking"
+            if request.stop:
+                return "stop is not supported when using trajectory tracking"
+            if request.stop_token_ids:
+                return "stop_token_ids is not supported when using trajectory tracking"
+            if request.n and request.n > 1:
+                return "n > 1 is not supported when using trajectory tracking"
+            if request.max_completion_tokens:
+                return "max_completion_tokens is not supported when using trajectory tracking"
+            request.no_stop_trim = True
         return None
 
     def _convert_to_internal_request(
@@ -262,8 +279,64 @@ class OpenAIServingChat(OpenAIServingBase):
         # Use chat template
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
+            if request.traj_id:
+                if is_multimodal:
+                    raise ValueError(
+                        "Multimodal is not supported when using trajectory tracking"
+                    )
+                if not isinstance(result.prompt_ids, list):
+                    raise ValueError(
+                        "When using trajectory tracking, the prompt_ids must be a list"
+                    )
+                if request.traj_id not in self.traj_map:
+                    cached_token_ids = result.prompt_ids
+                    output_token_mask = [0] * len(cached_token_ids)
+                    cached_request = request
+                    cached_tools_text = str(tools)
+                    self.traj_map[request.traj_id] = Trajectory(
+                        cached_token_ids=cached_token_ids,
+                        output_token_mask=output_token_mask,
+                        cached_request=cached_request,
+                        cached_tools_text=cached_tools_text,
+                        eos_token_id=self.tokenizer_manager.tokenizer.eos_token_id,
+                    )
+                else:
+                    traj = self.traj_map[request.traj_id]
+                    if traj.cached_tools_text != str(tools):
+                        raise ValueError(
+                            "The tools are not the same as the cached tools"
+                        )
+                    cached_result = self._apply_jinja_template(
+                        traj.cached_request,
+                        tools,
+                        is_multimodal,
+                        add_generation_prompt=False,
+                    )
+                    if not result.prompt.startswith(cached_result.prompt):
+                        raise ValueError(
+                            "The new prompt does not start with the cached prompt"
+                        )
+                    last_eos_index = len(cached_result.prompt_ids) - 1
+                    for t in reversed(cached_result.prompt_ids):
+                        if t == traj.eos_token_id:
+                            break
+                        last_eos_index -= 1
+                    if last_eos_index < 0:
+                        cached_token_len = len(cached_result.prompt_ids)
+                    else:
+                        cached_token_len = last_eos_index + 1
+                    delta_token_ids = result.prompt_ids[cached_token_len:]
+                    delta_output_token_mask = [0] * len(delta_token_ids)
+                    traj.cached_token_ids.extend(delta_token_ids)
+                    traj.output_token_mask.extend(delta_output_token_mask)
+                    traj.cached_request = request
+                    result.prompt_ids = traj.cached_token_ids
         else:
             result = self._apply_conversation_template(request, is_multimodal)
+            if request.traj_id:
+                raise ValueError(
+                    "Conversation template is not supported when using trajectory tracking"
+                )
 
         result.tool_call_constraint = tool_call_constraint
         return result
@@ -273,6 +346,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         tools: Optional[List[Dict]],
         is_multimodal: bool,
+        add_generation_prompt: bool = True,
     ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
         prompt = ""
@@ -351,7 +425,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,
-                    add_generation_prompt=True,
+                    add_generation_prompt=add_generation_prompt,
                     tools=tools,
                     reasoning_effort=request.reasoning_effort,
                     **(
@@ -373,7 +447,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
                         tokenize=True,
-                        add_generation_prompt=True,
+                        add_generation_prompt=add_generation_prompt,
                         tools=tools,
                         reasoning_effort=request.reasoning_effort,
                         **(
@@ -834,6 +908,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 hidden_states=hidden_states,
             )
             choices.append(choice_data)
+            if request.traj_id:
+                traj = self.traj_map[request.traj_id]
+                output_tokens = ret_item["output_ids"]
+                if (
+                    output_tokens[-1] != traj.eos_token_id
+                    and isinstance(choice_data.matched_stop, int)
+                    and choice_data.matched_stop == traj.eos_token_id
+                ):
+                    output_tokens.append(traj.eos_token_id)
+                traj.cached_token_ids.extend(output_tokens)
+                traj.output_token_mask.extend([1] * len(output_tokens))
+                traj.cached_request.messages.append(
+                    ChatCompletionMessageGenericParam(
+                        role="assistant",
+                        content=text,
+                        tool_calls=tool_calls,
+                        reasoning_content=reasoning_text,
+                    )
+                )
 
         # Calculate usage
         usage = UsageProcessor.calculate_response_usage(
@@ -1255,3 +1348,15 @@ class OpenAIServingChat(OpenAIServingBase):
             return f"data: {chunk.model_dump_json()}\n\n"
 
         return None
+
+    async def get_trajectory(self, traj_id: str) -> dict:
+        traj = self.traj_map[traj_id]
+        traj_json = traj.model_dump()
+        return {
+            "trajectory": traj_json["cached_request"],
+            "token_ids": traj_json["cached_token_ids"],
+            "output_token_mask": traj_json["output_token_mask"],
+        }
+
+    async def delete_trajectory(self, traj_id: str):
+        del self.traj_map[traj_id]
