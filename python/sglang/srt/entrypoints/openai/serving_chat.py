@@ -295,6 +295,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     raise ValueError(
                         "When using trajectory tracking, the prompt_ids must be a list"
                     )
+                # Preprocess the case where cached traj is not deleted after the first response.
+                if request.traj_id in self.traj_map and request.trajectory:
+                    maybe_updated_traj = Trajectory.model_validate(request.trajectory)
+                    if maybe_updated_traj.cached_token_ids:
+                        del self.traj_map[request.traj_id]
+
                 if request.traj_id not in self.traj_map and not request.trajectory:
                     # Neither cached traj nor given traj. Internally initialize a new traj.
                     cached_token_ids = result.prompt_ids
@@ -310,7 +316,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 elif request.traj_id in self.traj_map and request.trajectory:
                     raise ValueError(
-                        f"traj with id {request.traj_id} has been cached, but traj is given in the request"
+                        f"traj with id {request.traj_id} has been cached, but an empty traj is given in the request"
                     )
                 else:
                     # Either cached traj or given traj.
@@ -975,6 +981,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise ValueError(
                     f"Unexpected error: traj with id {request.traj_id} is not found"
                 )
+            traj.cached_request.trajectory = None
             metadata["trajectory"] = traj.model_dump()
 
         return ChatCompletionResponse(
@@ -983,7 +990,7 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=metadata,
         )
 
     def _process_logprobs_tokens(

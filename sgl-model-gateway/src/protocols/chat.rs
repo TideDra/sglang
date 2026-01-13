@@ -363,6 +363,10 @@ pub struct ChatCompletionRequest {
     /// Trajectory ID for tracking incremental tokenization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traj_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    // Internally used for trajectory tracking in http mode.
+    pub trajectory: Option<Value>
 }
 
 // ============================================================================
