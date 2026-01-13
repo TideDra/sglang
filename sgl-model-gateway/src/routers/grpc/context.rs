@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use axum::http::HeaderMap;
 
+use dashmap::DashMap;
+
 use super::{
     client::GrpcClient,
     proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
@@ -15,7 +17,7 @@ use super::{
 use crate::{
     core::{attach_guards_to_response, Worker, WorkerLoadGuard},
     protocols::{
-        chat::{ChatCompletionRequest, ChatCompletionResponse},
+        chat::{ChatCompletionRequest, ChatCompletionResponse, Trajectory},
         classify::{ClassifyRequest, ClassifyResponse},
         embedding::{EmbeddingRequest, EmbeddingResponse},
         generate::{GenerateRequest, GenerateResponse},
@@ -61,6 +63,7 @@ pub(crate) struct SharedComponents {
     pub tool_parser_factory: ToolParserFactory,
     #[allow(dead_code)]
     pub reasoning_parser_factory: ReasoningParserFactory,
+    pub trajectory_map: DashMap<String, Trajectory>,
 }
 
 /// Mutable processing state (evolves through pipeline stages)

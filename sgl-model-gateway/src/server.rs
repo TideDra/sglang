@@ -515,6 +515,27 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
+
+// ============================================================================
+// Trajectory Handlers
+// ============================================================================
+
+async fn trajectory_get(
+    State(state): State<Arc<AppState>>,
+    Path(trajectory_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state.router.get_trajectory(Some(&headers), &trajectory_id).await
+}
+
+async fn trajectory_delete(
+    State(state): State<Arc<AppState>>,
+    Path(trajectory_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state.router.delete_trajectory(Some(&headers), &trajectory_id).await
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -576,6 +597,8 @@ pub fn build_app(
         // Tokenize / Detokenize endpoints
         .route("/v1/tokenize", post(v1_tokenize))
         .route("/v1/detokenize", post(v1_detokenize))
+        // Trajectory endpoints
+        .route("/trajectory/{trajectory_id}", get(trajectory_get).delete(trajectory_delete))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             middleware::concurrency_limit_middleware,

@@ -11,7 +11,7 @@ use tracing::error;
 use crate::{
     grpc_client::sglang_proto::generate_complete::MatchedStop,
     protocols::{
-        chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
+        chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
         common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue},
         generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
     },
@@ -20,7 +20,7 @@ use crate::{
         error,
         grpc::{
             common::{response_collection, response_formatting},
-            context::{DispatchMetadata, ExecutionResult},
+            context::{DispatchMetadata, ExecutionResult, SharedComponents},
             proto_wrapper::ProtoGenerateComplete,
             utils,
         },
@@ -68,6 +68,7 @@ impl ResponseProcessor {
         history_tool_calls_count: usize,
         reasoning_parser_available: bool,
         tool_parser_available: bool,
+        shared_components: Arc<SharedComponents>,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
         // Decode tokens
@@ -196,8 +197,48 @@ impl ResponseProcessor {
             tool_calls,
             reasoning_content: reasoning_text,
         };
-
-        // Step 6: Build ChatChoice
+        // Step 6: Update trajectory if present
+        if let Some(traj_id) = original_request.traj_id.as_ref() {
+            match shared_components.trajectory_map.get_mut(traj_id) {
+                Some(mut traj) => {
+                    let eos_token = tokenizer.get_special_tokens().eos_token.clone();
+                    let output_token_ids = complete.output_ids().to_vec();
+                    // Force the last output token ID to be EOS token ID
+                    if let Some(eos_token) = eos_token {
+                        let eos_token_id = tokenizer.token_to_id(&eos_token);
+                        match eos_token_id {
+                            Some(eos_token_id) => {
+                                let last_output_token_id = output_token_ids.last();
+                                if let Some(last_output_token_id) = last_output_token_id {
+                                    if last_output_token_id != &eos_token_id {
+                                        error!("Last output token ID is not EOS token ID: {} != {}. EOS token: {}", last_output_token_id, eos_token_id, eos_token);
+                                        return Err("Last output token ID is not EOS token ID".to_string());
+                                    }
+                                }
+                            }
+                            None => {
+                                error!("Failed to get EOS token ID");
+                                return Err("Failed to get EOS token ID".to_string());
+                            }
+                        }
+                    }
+                    let output_token_mask = vec![1; output_token_ids.len()];
+                    traj.cached_token_ids.extend(output_token_ids);
+                    traj.output_token_mask.extend(output_token_mask);
+                    traj.cached_request.messages.push(ChatMessage::Assistant {
+                        content: chat_message.content.as_ref().map(|c| MessageContent::Text(c.clone())),
+                        name: None,
+                        tool_calls: chat_message.tool_calls.as_ref().cloned(),
+                        reasoning_content: chat_message.reasoning_content.as_ref().cloned(),
+                    });
+                },
+                None => {
+                    error!("Failed to find trajectory: {}", traj_id);
+                    return Err(format!("Failed to find trajectory: {}", traj_id));
+                }
+            }
+        }
+        // Step 7: Build ChatChoice
         Ok(ChatChoice {
             index: index as u32,
             message: chat_message,
@@ -209,6 +250,7 @@ impl ResponseProcessor {
     }
 
     /// Process non-streaming chat response (collects all responses and builds final response)
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_non_streaming_chat_response(
         &self,
         execution_result: ExecutionResult,
@@ -217,6 +259,7 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
+        shared_components: Arc<SharedComponents>,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
         // Collect all responses from the execution result
         let all_responses =
@@ -273,6 +316,7 @@ impl ResponseProcessor {
                     history_tool_calls_count,
                     reasoning_parser_available,
                     tool_parser_available,
+                    shared_components.clone(),
                 )
                 .await
             {
