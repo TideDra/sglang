@@ -297,9 +297,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 # Preprocess the case where cached traj is not deleted after the first response.
                 if request.traj_id in self.traj_map and request.trajectory:
-                    maybe_updated_traj = Trajectory.model_validate(request.trajectory)
-                    if maybe_updated_traj.cached_token_ids:
-                        del self.traj_map[request.traj_id]
+                    del self.traj_map[request.traj_id]
 
                 if request.traj_id not in self.traj_map and not request.trajectory:
                     # Neither cached traj nor given traj. Internally initialize a new traj.
@@ -316,7 +314,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 elif request.traj_id in self.traj_map and request.trajectory:
                     raise ValueError(
-                        f"traj with id {request.traj_id} has been cached, but an empty traj is given in the request"
+                        f"traj with id {request.traj_id} has been cached, but a traj is given in the request"
                     )
                 else:
                     # Either cached traj or given traj.
@@ -350,6 +348,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             cached_token_len = len(cached_result.prompt_ids)
                         else:
                             cached_token_len = last_eos_index + 1
+                        if result.prompt == cached_result.prompt:
+                            # If the prompt is the same, cached token should keep unchanged.
+                            cached_token_len = len(result.prompt_ids)
                         delta_token_ids = result.prompt_ids[cached_token_len:]
                         delta_output_token_mask = [0] * len(delta_token_ids)
                         traj.cached_token_ids.extend(delta_token_ids)
