@@ -539,6 +539,8 @@ class ChatCompletionRequest(BaseModel):
 
     # For trajectory tracking
     traj_id: Optional[str] = None
+    # This field should only be used by the router
+    trajectory: Optional[Dict] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -1243,8 +1245,8 @@ ResponseInputOutputItem: TypeAlias = Union[
 
 
 class Trajectory(BaseModel):
-    cached_token_ids: List[int]
-    output_token_mask: List[int]
-    cached_request: ChatCompletionRequest
-    cached_tools_text: str
-    eos_token_id: int
+    cached_token_ids: Optional[List[int]] = None
+    output_token_mask: Optional[List[int]] = None
+    cached_request: Optional[ChatCompletionRequest] = None
+    cached_tools_text: Optional[str] = None
+    eos_token_id: Optional[int] = None

@@ -147,7 +147,14 @@ class OpenAIServingChat(OpenAIServingBase):
             schema = getattr(request.response_format.json_schema, "schema_", None)
             if schema is None:
                 return "schema_ is required for json_schema response format request."
-        if request.traj_id:
+        if request.traj_id or request.trajectory:
+            if request.trajectory:
+                try:
+                    Trajectory.model_validate(request.trajectory)
+                except Exception as e:
+                    return f"trajectory is invalid: {str(e)}"
+                if not request.traj_id:
+                    return "traj_id is required when trajectory is given"
             if request.continue_final_message:
                 return "continue_final_message is not supported when using trajectory tracking"
             if request.stream:
@@ -288,7 +295,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     raise ValueError(
                         "When using trajectory tracking, the prompt_ids must be a list"
                     )
-                if request.traj_id not in self.traj_map:
+                if request.traj_id not in self.traj_map and not request.trajectory:
+                    # Neither cached traj nor given traj. Internally initialize a new traj.
                     cached_token_ids = result.prompt_ids
                     output_token_mask = [0] * len(cached_token_ids)
                     cached_request = request
@@ -300,37 +308,58 @@ class OpenAIServingChat(OpenAIServingBase):
                         cached_tools_text=cached_tools_text,
                         eos_token_id=self.tokenizer_manager.tokenizer.eos_token_id,
                     )
-                else:
-                    traj = self.traj_map[request.traj_id]
-                    if traj.cached_tools_text != str(tools):
-                        raise ValueError(
-                            "The tools are not the same as the cached tools"
-                        )
-                    cached_result = self._apply_jinja_template(
-                        traj.cached_request,
-                        tools,
-                        is_multimodal,
-                        add_generation_prompt=False,
+                elif request.traj_id in self.traj_map and request.trajectory:
+                    raise ValueError(
+                        f"traj with id {request.traj_id} has been cached, but traj is given in the request"
                     )
-                    if not result.prompt.startswith(cached_result.prompt):
-                        raise ValueError(
-                            "The new prompt does not start with the cached prompt"
+                else:
+                    # Either cached traj or given traj.
+                    if request.traj_id not in self.traj_map:
+                        # Given traj.
+                        traj = Trajectory.model_validate(request.trajectory)
+                        # Temporarily store the given traj for retrieval in decode stage.
+                        self.traj_map[request.traj_id] = traj
+                    traj = self.traj_map[request.traj_id]
+                    if traj.cached_token_ids:
+                        if traj.cached_tools_text != str(tools):
+                            raise ValueError(
+                                "The tools are not the same as the cached tools"
+                            )
+                        cached_result = self._apply_jinja_template(
+                            traj.cached_request,
+                            tools,
+                            is_multimodal,
+                            add_generation_prompt=False,
                         )
-                    last_eos_index = len(cached_result.prompt_ids) - 1
-                    for t in reversed(cached_result.prompt_ids):
-                        if t == traj.eos_token_id:
-                            break
-                        last_eos_index -= 1
-                    if last_eos_index < 0:
-                        cached_token_len = len(cached_result.prompt_ids)
+                        if not result.prompt.startswith(cached_result.prompt):
+                            raise ValueError(
+                                "The new prompt does not start with the cached prompt"
+                            )
+                        last_eos_index = len(cached_result.prompt_ids) - 1
+                        for t in reversed(cached_result.prompt_ids):
+                            if t == traj.eos_token_id:
+                                break
+                            last_eos_index -= 1
+                        if last_eos_index < 0:
+                            cached_token_len = len(cached_result.prompt_ids)
+                        else:
+                            cached_token_len = last_eos_index + 1
+                        delta_token_ids = result.prompt_ids[cached_token_len:]
+                        delta_output_token_mask = [0] * len(delta_token_ids)
+                        traj.cached_token_ids.extend(delta_token_ids)
+                        traj.output_token_mask.extend(delta_output_token_mask)
+                        traj.cached_request = request
+                        result.prompt_ids = traj.cached_token_ids
                     else:
-                        cached_token_len = last_eos_index + 1
-                    delta_token_ids = result.prompt_ids[cached_token_len:]
-                    delta_output_token_mask = [0] * len(delta_token_ids)
-                    traj.cached_token_ids.extend(delta_token_ids)
-                    traj.output_token_mask.extend(delta_output_token_mask)
-                    traj.cached_request = request
-                    result.prompt_ids = traj.cached_token_ids
+                        # Given traj is empty.
+                        traj.cached_token_ids = result.prompt_ids
+                        traj.output_token_mask = [0] * len(result.prompt_ids)
+                        traj.cached_request = request
+                        traj.cached_tools_text = str(tools)
+                        traj.eos_token_id = (
+                            self.tokenizer_manager.tokenizer.eos_token_id
+                        )
+
         else:
             result = self._apply_conversation_template(request, is_multimodal)
             if request.traj_id:
@@ -934,6 +963,19 @@ class OpenAIServingChat(OpenAIServingBase):
             n_choices=request.n,
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
+        metadata = {"weight_version": ret[0]["meta_info"]["weight_version"]}
+        if request.trajectory:
+            if not request.traj_id:
+                raise ValueError(
+                    "Unexpected error: traj_id is required when trajectory is given"
+                )
+            # Given traj is not stored.
+            traj = self.traj_map.pop(request.traj_id, None)
+            if traj is None:
+                raise ValueError(
+                    f"Unexpected error: traj with id {request.traj_id} is not found"
+                )
+            metadata["trajectory"] = traj.model_dump()
 
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
