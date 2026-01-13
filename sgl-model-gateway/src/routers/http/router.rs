@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{header::{CONTENT_TYPE, CONTENT_LENGTH}, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -11,7 +11,8 @@ use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
-
+use dashmap::{DashMap, DashSet};
+use serde_json::{Value, json};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
@@ -42,6 +43,19 @@ use crate::{
     },
 };
 
+/// RAII guard to ensure traj_id is removed from processing set when dropped
+struct TrajLockGuard<'a> {
+    traj_id: String,
+    processing_set: &'a DashSet<String>,
+}
+
+impl<'a> Drop for TrajLockGuard<'a> {
+    fn drop(&mut self) {
+        self.processing_set.remove(&self.traj_id);
+        debug!("Released lock for traj_id={}", self.traj_id);
+    }
+}
+
 /// Regular router that uses injected load balancing policies
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
@@ -50,6 +64,8 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
+    traj_map: DashMap<String, Value>,
+    processing_traj_ids: DashSet<String>,
 }
 
 impl std::fmt::Debug for Router {
@@ -75,6 +91,8 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
+            traj_map: DashMap::new(),
+            processing_traj_ids: DashSet::new(),
         })
     }
 
@@ -747,8 +765,173 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        if let Some(traj_id) = &body.traj_id {
+            // trajectory management only supported for non-streaming requests
+            if body.stream {
+                return error::bad_request(
+                    "trajectory_not_supported_for_streaming",
+                    "Trajectory management (traj_id) is not supported for streaming requests",
+                );
+            }
+
+            // Try to acquire exclusive lock for this traj_id
+            if !self.processing_traj_ids.insert(traj_id.clone()) {
+                // traj_id is already being processed by another request
+                return error::bad_request(
+                    "trajectory_locked",
+                    format!("Trajectory with id '{}' is currently being processed by another request", traj_id),
+                );
+            }
+
+            // Create RAII guard to ensure lock is released when function returns
+            let _lock_guard = TrajLockGuard {
+                traj_id: traj_id.clone(),
+                processing_set: &self.processing_traj_ids,
+            };
+
+            if !self.traj_map.contains_key(traj_id) {
+                // Initialize a new trajectory.
+                self.traj_map.insert(traj_id.clone(), json!({"cached_token_ids": null, "output_token_mask": null, "cached_request": null, "cached_tools_text": null, "eos_token_id": null}));
+            }
+            // Clone the trajectory value and immediately drop the lock
+            let trajectory_value = self.traj_map.get(traj_id)
+                .expect("Unexpected error: traj not found")
+                .value()
+                .clone();
+            // Now the lock is released
+            let mut new_body = body.clone();
+            new_body.trajectory = Some(trajectory_value);
+
+            let result = self.route_typed_request(headers, &new_body, "/v1/chat/completions", model_id).await;
+
+            // Extract and process response body
+            if result.status().is_success() {
+                let status = result.status();
+                let headers_clone = result.headers().clone();
+
+                // Extract response body (limit to 100MB for safety)
+                const MAX_BODY_SIZE: usize = 100 * 1024 * 1024; // 100MB
+                let body_bytes = match to_bytes(result.into_body(), MAX_BODY_SIZE).await {
+                    Ok(bytes) => {
+                        bytes
+                    }
+                    Err(e) => {
+                        error!("Failed to read response body: {}", e);
+                        return error::internal_error("read_response_body_failed", e.to_string());
+                    }
+                };
+
+                // Deserialize as JSON - must succeed
+                let mut json_data = match serde_json::from_slice::<Value>(&body_bytes) {
+                    Ok(data) => {
+                        data
+                    }
+                    Err(e) => {
+                        error!("Failed to parse response as JSON: {}", e);
+                        return error::internal_error("parse_response_json_failed", format!("Failed to parse response as JSON: {}", e));
+                    }
+                };
+
+                // Extract metadata - must exist
+                let metadata = match json_data.get_mut("metadata") {
+                    Some(meta) => {
+                        meta
+                    }
+                    None => {
+                        error!("Response missing metadata field");
+                        return error::internal_error("missing_metadata", "Response missing metadata field");
+                    }
+                };
+
+                // Extract trajectory - must exist
+                let trajectory = match metadata.get("trajectory") {
+                    Some(traj) => {
+                        traj
+                    }
+                    None => {
+                        error!("Response metadata missing trajectory field");
+                        return error::internal_error("missing_trajectory", "Response metadata missing trajectory field");
+                    }
+                };
+
+                // Update traj_map with the new trajectory
+                self.traj_map.insert(traj_id.clone(), trajectory.clone());
+
+                // Remove trajectory from response metadata
+                if let Some(obj) = metadata.as_object_mut() {
+                    obj.remove("trajectory");
+                }
+
+                // Serialize back to bytes - must succeed
+                let modified_body = match serde_json::to_vec(&json_data) {
+                    Ok(body) => {
+                        body
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize modified response: {}", e);
+                        return error::internal_error("serialize_response_failed", format!("Failed to serialize modified response: {}", e));
+                    }
+                };
+
+                let body_len = modified_body.len();
+                let mut response = Response::new(Body::from(modified_body));
+                *response.status_mut() = status;
+                *response.headers_mut() = headers_clone;
+
+                // Update Content-Length header to match the modified body size
+                response.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                response.headers_mut().insert(
+                    CONTENT_LENGTH,
+                    HeaderValue::from_str(&body_len.to_string()).unwrap(),
+                );
+
+                debug!("Returning response for traj_id={} with body_len={}", traj_id, body_len);
+                response
+            } else {
+                // For error responses, just return as-is
+                result
+            }
+        } else {
+            self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+                .await
+        }
+    }
+
+    async fn get_trajectory(&self, _headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        // Check if trajectory is currently being processed
+        if self.processing_traj_ids.contains(traj_id) {
+            return error::bad_request(
+                "trajectory_locked",
+                format!("Trajectory with id '{}' is currently being processed", traj_id),
+            );
+        }
+
+        if self.traj_map.contains_key(traj_id) {
+            let trajectory = self.traj_map.get(traj_id).unwrap().value().clone();
+            return Json(json!({ "cached_request": trajectory["cached_request"], "token_ids": trajectory["cached_token_ids"], "output_token_mask": trajectory["output_token_mask"] })).into_response();
+        } else {
+            return error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id));
+        }
+    }
+
+    async fn delete_trajectory(&self, _headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        // Check if trajectory is currently being processed
+        if self.processing_traj_ids.contains(traj_id) {
+            return error::bad_request(
+                "trajectory_locked",
+                format!("Trajectory with id '{}' is currently being processed, cannot delete", traj_id),
+            );
+        }
+
+        if self.traj_map.contains_key(traj_id) {
+            self.traj_map.remove(traj_id);
+            return Json(serde_json::json!({ "message": "Trajectory deleted" })).into_response();
+        } else {
+            return error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id));
+        }
     }
 
     async fn route_completion(
@@ -865,6 +1048,8 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             enable_igw: false,
+            traj_map: DashMap::new(),
+            processing_traj_ids: DashSet::new(),
         }
     }
 
