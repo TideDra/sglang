@@ -335,20 +335,21 @@ class OpenAIServingChat(OpenAIServingBase):
                             is_multimodal,
                             add_generation_prompt=False,
                         )
-                        if not result.prompt.startswith(cached_result.prompt):
+                        cached_prompt_ids_len = len(cached_result.prompt_ids)
+                        if result.prompt_ids[:cached_prompt_ids_len] != cached_result.prompt_ids:
                             raise ValueError(
                                 "The new prompt does not start with the cached prompt"
                             )
-                        last_eos_index = len(cached_result.prompt_ids) - 1
+                        last_eos_index = cached_prompt_ids_len - 1
                         for t in reversed(cached_result.prompt_ids):
                             if t == traj.eos_token_id:
                                 break
                             last_eos_index -= 1
                         if last_eos_index < 0:
-                            cached_token_len = len(cached_result.prompt_ids)
+                            cached_token_len = cached_prompt_ids_len
                         else:
                             cached_token_len = last_eos_index + 1
-                        if result.prompt == cached_result.prompt:
+                        if len(result.prompt_ids) == cached_prompt_ids_len:
                             # If the prompt is the same, cached token should keep unchanged.
                             cached_token_len = len(result.prompt_ids)
                         delta_token_ids = result.prompt_ids[cached_token_len:]
@@ -945,6 +946,14 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             choices.append(choice_data)
             if request.traj_id:
+                if finish_reason["type"] == "abort":
+                    if request.trajectory:
+                        self.traj_map.pop(request.traj_id)
+                    return self.create_error_response(
+                        "Request aborted",
+                        err_type="InternalServerError",
+                        status_code=500,
+                    )
                 traj = self.traj_map[request.traj_id]
                 output_tokens = ret_item["output_ids"]
                 if (
