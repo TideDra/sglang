@@ -594,12 +594,6 @@ fn validate_chat_cross_parameters(
             e.message = Some("traj_id and n cannot be used together".into());
             return Err(e);
         }
-        if req.max_completion_tokens.is_some() {
-            // Currently, we assume a generation request always stops at EOS token.
-            let mut e = validator::ValidationError::new("traj_id_and_max_completion_tokens");
-            e.message = Some("traj_id and max_completion_tokens cannot be used together".into());
-            return Err(e);
-        }
     }
 
     Ok(())
