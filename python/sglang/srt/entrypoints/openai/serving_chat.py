@@ -165,8 +165,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "stop_token_ids is not supported when using trajectory tracking"
             if request.n and request.n > 1:
                 return "n > 1 is not supported when using trajectory tracking"
-            if request.max_completion_tokens:
-                return "max_completion_tokens is not supported when using trajectory tracking"
+
             request.no_stop_trim = True
         return None
 
@@ -303,11 +302,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Neither cached traj nor given traj. Internally initialize a new traj.
                     cached_token_ids = result.prompt_ids
                     output_token_mask = [0] * len(cached_token_ids)
+                    cached_token_logprobs = [0] * len(cached_token_ids)
                     cached_request = request
                     cached_tools_text = str(tools)
                     self.traj_map[request.traj_id] = Trajectory(
                         cached_token_ids=cached_token_ids,
                         output_token_mask=output_token_mask,
+                        cached_token_logprobs=cached_token_logprobs,
                         cached_request=cached_request,
                         cached_tools_text=cached_tools_text,
                         eos_token_id=self.tokenizer_manager.tokenizer.eos_token_id,
@@ -336,7 +337,10 @@ class OpenAIServingChat(OpenAIServingBase):
                             add_generation_prompt=False,
                         )
                         cached_prompt_ids_len = len(cached_result.prompt_ids)
-                        if result.prompt_ids[:cached_prompt_ids_len] != cached_result.prompt_ids:
+                        if (
+                            result.prompt_ids[:cached_prompt_ids_len]
+                            != cached_result.prompt_ids
+                        ):
                             raise ValueError(
                                 "The new prompt does not start with the cached prompt"
                             )
@@ -354,14 +358,17 @@ class OpenAIServingChat(OpenAIServingBase):
                             cached_token_len = len(result.prompt_ids)
                         delta_token_ids = result.prompt_ids[cached_token_len:]
                         delta_output_token_mask = [0] * len(delta_token_ids)
+                        delta_token_logprobs = [0] * len(delta_token_ids)
                         traj.cached_token_ids.extend(delta_token_ids)
                         traj.output_token_mask.extend(delta_output_token_mask)
+                        traj.cached_token_logprobs.extend(delta_token_logprobs)
                         traj.cached_request = request
                         result.prompt_ids = traj.cached_token_ids
                     else:
                         # Given traj is empty.
                         traj.cached_token_ids = result.prompt_ids
                         traj.output_token_mask = [0] * len(result.prompt_ids)
+                        traj.cached_token_logprobs = [0] * len(result.prompt_ids)
                         traj.cached_request = request
                         traj.cached_tools_text = str(tools)
                         traj.eos_token_id = (
@@ -946,7 +953,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             choices.append(choice_data)
             if request.traj_id:
-                if finish_reason["type"] == "abort":
+                if choice_data.finish_reason == "abort":
                     if request.trajectory:
                         self.traj_map.pop(request.traj_id)
                     return self.create_error_response(
@@ -956,14 +963,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 traj = self.traj_map[request.traj_id]
                 output_tokens = ret_item["output_ids"]
-                if (
-                    output_tokens[-1] != traj.eos_token_id
-                    and isinstance(choice_data.matched_stop, int)
-                    and choice_data.matched_stop == traj.eos_token_id
-                ):
-                    output_tokens.append(traj.eos_token_id)
                 traj.cached_token_ids.extend(output_tokens)
                 traj.output_token_mask.extend([1] * len(output_tokens))
+                if choice_logprobs:
+                    traj.cached_token_logprobs.extend(
+                        [x.logprob for x in choice_logprobs.content]
+                    )
+                else:
+                    traj.cached_token_logprobs.extend([0] * len(output_tokens))
+                if traj.cached_token_ids[-1] != traj.eos_token_id:
+                    if choice_data.finish_reason != "length":
+                        raise ValueError(
+                            f"Unexpected error: finish reason {choice_data.finish_reason} is not length"
+                        )
+                    traj.cached_token_ids.append(traj.eos_token_id)
+                    traj.output_token_mask.append(0)
+                    traj.cached_token_logprobs.append(0)
+                assert len(traj.cached_token_ids) == len(traj.cached_token_logprobs)
                 traj.cached_request.messages.append(
                     ChatCompletionMessageGenericParam(
                         role="assistant",
@@ -1415,6 +1431,7 @@ class OpenAIServingChat(OpenAIServingBase):
             "trajectory": traj_json["cached_request"],
             "token_ids": traj_json["cached_token_ids"],
             "output_token_mask": traj_json["output_token_mask"],
+            "token_logprobs": traj_json["cached_token_logprobs"],
         }
 
     async def delete_trajectory(self, traj_id: str):

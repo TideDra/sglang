@@ -785,7 +785,7 @@ impl RouterTrait for Router {
 
             if !self.traj_map.contains_key(traj_id) {
                 // Initialize a new trajectory.
-                self.traj_map.insert(traj_id.clone(), json!({"cached_token_ids": null, "output_token_mask": null, "cached_request": null, "cached_tools_text": null, "eos_token_id": null}));
+                self.traj_map.insert(traj_id.clone(), json!({"cached_token_ids": null, "output_token_mask": null, "cached_request": null, "cached_tools_text": null, "eos_token_id": null, "cached_token_logprobs": null}));
             }
             // Clone the trajectory value and immediately drop the lock
             let trajectory_value = self.traj_map.get(traj_id)
@@ -905,7 +905,7 @@ impl RouterTrait for Router {
 
         if self.traj_map.contains_key(traj_id) {
             let trajectory = self.traj_map.get(traj_id).unwrap().value().clone();
-            return Json(json!({ "cached_request": trajectory["cached_request"], "token_ids": trajectory["cached_token_ids"], "output_token_mask": trajectory["output_token_mask"] })).into_response();
+            return Json(json!({ "trajectory": trajectory["cached_request"], "token_ids": trajectory["cached_token_ids"], "output_token_mask": trajectory["output_token_mask"], "token_logprobs": trajectory["cached_token_logprobs"] })).into_response();
         } else {
             return error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id));
         }
