@@ -16,21 +16,21 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 use dashmap::{DashMap, DashSet};
 use serde_json::{Value, json};
+use uuid::Uuid;
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        ConnectionMode, RetryExecutor, UNKNOWN_MODEL_ID, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, is_retryable_status
     },
     observability::{
         events::{self, Event},
-        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        metrics::{Metrics, bool_to_static_str, metrics_labels},
         otel_trace::inject_trace_context_http,
     },
     policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        chat::ChatCompletionRequest,
+        chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
         classify::ClassifyRequest,
         common::GenerationRequest,
         completion::CompletionRequest,
@@ -40,9 +40,7 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error::{self, extract_error_code_from_response},
-        grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        RouterTrait, error::{self, extract_error_code_from_response}, grpc::{regular::responses::conversions::{chat_to_responses, responses_to_chat}, utils::{error_type_from_status, route_to_endpoint}}, header_utils
     },
 };
 
@@ -793,6 +791,7 @@ impl RouterTrait for Router {
                 .value()
                 .clone();
             // Now the lock is released
+            drop(_lock_guard);
             let mut new_body = body.clone();
             new_body.trajectory = Some(trajectory_value);
 
@@ -944,8 +943,198 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
-            .await
+        let traj_id = match &body.previous_response_id {
+            Some(id) => id,
+            None => &format!("resp_{}", Uuid::new_v4()), // Root node. Will not be used by user.
+        };
+
+        if body.stream.unwrap_or(false) {
+            return error::bad_request(
+                "trajectory_not_supported_for_streaming",
+                "Trajectory management (traj_id) is not supported for streaming requests",
+            );
+        }
+
+        // Try to acquire exclusive lock for this traj_id
+        if !self.processing_traj_ids.insert(traj_id.clone()) {
+            // traj_id is already being processed by another request
+            return error::bad_request(
+                "trajectory_locked",
+                format!("Trajectory with id '{}' is currently being processed by another request", traj_id),
+            );
+        }
+
+        // Create RAII guard to ensure lock is released when function returns
+        let _lock_guard = TrajLockGuard {
+            traj_id: traj_id.clone(),
+            processing_set: &self.processing_traj_ids,
+        };
+
+        let mut chat_body = match self.traj_map.get(traj_id) {
+            Some(traj) => {
+                let cached_request = traj.value().get("cached_request").unwrap();
+                let chat_body = serde_json::from_value::<ChatCompletionRequest>(cached_request.clone()).unwrap();
+                let raw_messages = chat_body.messages;
+                let raw_instruction = match raw_messages.first().unwrap() {
+                    ChatMessage::System { content, name:_ } => Some(content.to_simple_string().clone()),
+                    _ => None,
+                };
+                let mut body_without_instructions = body.clone();
+                body_without_instructions.instructions = None;
+                let mut new_chat_body = responses_to_chat(&body_without_instructions).unwrap();
+                let incoming_messages = new_chat_body.messages;
+                let mut merged_messages = Vec::new();
+                merged_messages.extend(raw_messages);
+                merged_messages.extend(incoming_messages);
+                new_chat_body.messages = merged_messages;
+                new_chat_body.traj_id = Some(traj_id.clone());
+                if raw_instruction != body.instructions {
+                    let first_msg = new_chat_body.messages.first_mut().unwrap();
+                    if raw_instruction.is_none() {
+                        // We have new instructions
+                        if let ChatMessage::System { content:_, name:_ } = first_msg {
+                            return error::internal_error("instructions_mismatch", "Unexpected error: System message should not exist.");
+                        }
+                        new_chat_body.messages.insert(0, ChatMessage::System { content: MessageContent::Text(body.instructions.clone().unwrap()), name: None });
+                    } else if body.instructions.is_none() {
+                        // We have old instructions
+                        match first_msg {
+                            ChatMessage::System { content:_, name:_ } => {},
+                            _ => {
+                                return error::internal_error("instructions_mismatch", "Unexpected error: System message should exist.");
+                            }
+                        }
+                        new_chat_body.messages.remove(0);
+                    } else {
+                        // We have different instructions
+                        match first_msg {
+                            ChatMessage::System { content, name:_ } => {
+                                *content = MessageContent::Text(body.instructions.clone().unwrap());
+                            }
+                            _ => {
+                                return error::internal_error("instructions_mismatch", "Unexpected error: System message should exist.");
+                            }
+                        }
+                    }
+                    // Create new traj tree
+                    new_chat_body.traj_id = Some(format!("resp_{}", Uuid::new_v4()));
+                }
+                new_chat_body
+
+            }
+            None => {
+                let mut new_chat_body = responses_to_chat(body).unwrap();
+                new_chat_body.traj_id = Some(traj_id.clone());
+                new_chat_body
+            }
+        };
+        chat_body.logprobs = true;
+
+        let traj_id = chat_body.traj_id.as_ref().unwrap();
+
+        if !self.traj_map.contains_key(traj_id) {
+            // Initialize a new trajectory.
+            self.traj_map.insert(traj_id.clone(), json!({"cached_token_ids": null, "output_token_mask": null, "cached_request": null, "cached_tools_text": null, "eos_token_id": null, "cached_token_logprobs": null}));
+        }
+        // Clone the trajectory value and immediately drop the lock
+        let trajectory_value = self.traj_map.get(traj_id)
+            .expect("Unexpected error: traj not found")
+            .value()
+            .clone();
+        // Now the lock is released
+
+        chat_body.trajectory = Some(trajectory_value);
+        drop(_lock_guard);
+
+        let result = self.route_typed_request(headers, &chat_body, "/v1/chat/completions", model_id).await;
+
+        // Extract and process response body
+        if result.status().is_success() {
+            let status = result.status();
+            let headers_clone = result.headers().clone();
+
+            // Extract response body (limit to 100MB for safety)
+            const MAX_BODY_SIZE: usize = 100 * 1024 * 1024; // 100MB
+            let body_bytes = match to_bytes(result.into_body(), MAX_BODY_SIZE).await {
+                Ok(bytes) => {
+                    bytes
+                }
+                Err(e) => {
+                    error!("Failed to read response body: {}", e);
+                    return error::internal_error("read_response_body_failed", e.to_string());
+                }
+            };
+
+            // Deserialize as JSON - must succeed
+            let chat_response = match serde_json::from_slice::<ChatCompletionResponse>(&body_bytes) {
+                Ok(data) => {
+                    data
+                }
+                Err(e) => {
+                    error!("Failed to parse response as JSON: {}", e);
+                    return error::internal_error("parse_response_json_failed", format!("Failed to parse response as JSON: {}", e));
+                }
+            };
+
+            // Extract metadata - must exist
+            let metadata = match chat_response.metadata.as_ref() {
+                Some(meta) => {
+                    meta
+                }
+                None => {
+                    error!("Response missing metadata field");
+                    return error::internal_error("missing_metadata", "Response missing metadata field");
+                }
+            };
+
+            // Extract trajectory - must exist
+            let trajectory = match metadata.get("trajectory") {
+                Some(traj) => {
+                    traj
+                }
+                None => {
+                    error!("Response metadata missing trajectory field");
+                    return error::internal_error("missing_trajectory", "Response metadata missing trajectory field");
+                }
+            };
+            let new_response_id = format!("resp_{}", Uuid::new_v4());
+            // Update traj_map with the new trajectory
+            self.traj_map.insert(new_response_id.clone(), trajectory.clone());
+
+            let responses_response = chat_to_responses(&chat_response, body, Some(new_response_id)).expect("Failed to convert chat response to responses response");
+
+            // Serialize back to bytes - must succeed
+            let modified_body = match serde_json::to_vec(&responses_response) {
+                Ok(body) => {
+                    body
+                }
+                Err(e) => {
+                    error!("Failed to serialize modified response: {}", e);
+                    return error::internal_error("serialize_response_failed", format!("Failed to serialize modified response: {}", e));
+                }
+            };
+
+            let body_len = modified_body.len();
+            let mut response = Response::new(Body::from(modified_body));
+            *response.status_mut() = status;
+            *response.headers_mut() = headers_clone;
+
+            // Update Content-Length header to match the modified body size
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response.headers_mut().insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&body_len.to_string()).unwrap(),
+            );
+
+            debug!("Returning response for traj_id={} with body_len={}", traj_id, body_len);
+            response
+        } else {
+            // For error responses, just return as-is
+            result
+        }
     }
 
     async fn get_response(

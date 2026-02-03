@@ -9,7 +9,7 @@
 
 // Module declarations
 pub mod context;
-mod conversions;
+pub(crate) mod conversions;
 mod handlers;
 pub mod tool_loop;
 pub mod types;
