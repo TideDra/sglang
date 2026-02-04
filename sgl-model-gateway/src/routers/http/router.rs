@@ -944,7 +944,12 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
     ) -> Response {
         let traj_id = match &body.previous_response_id {
-            Some(id) => id,
+            Some(id) => {
+                if !self.traj_map.contains_key(id) {
+                    return error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", id));
+                }
+                id
+            },
             None => &format!("resp_{}", Uuid::new_v4()), // Root node. Will not be used by user.
         };
 
