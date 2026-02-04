@@ -66,6 +66,7 @@ pub struct Router {
     enable_igw: bool,
     retry_config: RetryConfig,
     traj_map: DashMap<String, Value>,
+    traj_chain: DashMap<String, Vec<String>>,
     processing_traj_ids: DashSet<String>,
 }
 
@@ -93,6 +94,7 @@ impl Router {
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
             traj_map: DashMap::new(),
+            traj_chain: DashMap::new(),
             processing_traj_ids: DashSet::new(),
         })
     }
@@ -784,6 +786,7 @@ impl RouterTrait for Router {
             if !self.traj_map.contains_key(traj_id) {
                 // Initialize a new trajectory.
                 self.traj_map.insert(traj_id.clone(), json!({"cached_token_ids": null, "output_token_mask": null, "cached_request": null, "cached_tools_text": null, "eos_token_id": null, "cached_token_logprobs": null}));
+                self.traj_chain.insert(traj_id.clone(), vec![]);
             }
             // Clone the trajectory value and immediately drop the lock
             let trajectory_value = self.traj_map.get(traj_id)
@@ -920,7 +923,21 @@ impl RouterTrait for Router {
         }
 
         if self.traj_map.contains_key(traj_id) {
+            // Clone children list before recursion to avoid holding the lock during recursive calls
+            let children = self.traj_chain.get(traj_id)
+                .expect("Unexpected error: traj chain not found")
+                .value()
+                .clone();
+
+            // Now we can safely iterate and recursively delete without holding the lock
+            for c in children.iter() {
+                let response = self.delete_trajectory(_headers, c.as_str()).await;
+                if !response.status().is_success() {
+                    return response;
+                }
+            }
             self.traj_map.remove(traj_id);
+            self.traj_chain.remove(traj_id);
             return Json(serde_json::json!({ "message": "Trajectory deleted" })).into_response();
         } else {
             return error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id));
@@ -974,6 +991,8 @@ impl RouterTrait for Router {
             traj_id: traj_id.clone(),
             processing_set: &self.processing_traj_ids,
         };
+
+        let mut is_empty_node = false;
 
         let mut chat_body = match self.traj_map.get(traj_id) {
             Some(traj) => {
@@ -1040,6 +1059,9 @@ impl RouterTrait for Router {
         if !self.traj_map.contains_key(traj_id) {
             // Initialize a new trajectory.
             self.traj_map.insert(traj_id.clone(), json!({"cached_token_ids": null, "output_token_mask": null, "cached_request": null, "cached_tools_text": null, "eos_token_id": null, "cached_token_logprobs": null}));
+            self.traj_chain.insert(traj_id.clone(), vec![]);
+            // Root node will not be accessed again, we will delete it later
+            is_empty_node = true;
         }
         // Clone the trajectory value and immediately drop the lock
         let trajectory_value = self.traj_map.get(traj_id)
@@ -1047,6 +1069,11 @@ impl RouterTrait for Router {
             .value()
             .clone();
         // Now the lock is released
+
+        if is_empty_node {
+            self.traj_chain.remove(traj_id).expect("Unexpected error: traj chain not found");
+            self.traj_map.remove(traj_id).expect("Unexpected error: traj not found");
+        }
 
         chat_body.trajectory = Some(trajectory_value);
         drop(_lock_guard);
@@ -1105,6 +1132,12 @@ impl RouterTrait for Router {
             let new_response_id = format!("resp_{}", Uuid::new_v4());
             // Update traj_map with the new trajectory
             self.traj_map.insert(new_response_id.clone(), trajectory.clone());
+            // Always initialize traj_chain for the new response_id
+            self.traj_chain.insert(new_response_id.clone(), vec![]);
+
+            if let Some(id) = &body.previous_response_id {
+                self.traj_chain.get_mut(id).expect("Unexpected error: traj chain not found").push(new_response_id.clone());
+            }
 
             let responses_response = chat_to_responses(&chat_response, body, Some(new_response_id)).expect("Failed to convert chat response to responses response");
 
@@ -1237,6 +1270,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             enable_igw: false,
             traj_map: DashMap::new(),
+            traj_chain: DashMap::new(),
             processing_traj_ids: DashSet::new(),
         }
     }
