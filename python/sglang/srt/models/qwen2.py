@@ -90,6 +90,9 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        if get_global_server_args().rl_on_policy_target is not None:
+            x = x.bfloat16()
+
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -276,6 +279,11 @@ class Qwen2Model(nn.Module):
                 quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
+                params_dtype=(
+                    torch.float32
+                    if get_global_server_args().rl_on_policy_target is not None
+                    else None
+                ),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -298,8 +306,10 @@ class Qwen2Model(nn.Module):
         if self.pp_group.is_last_rank:
             norm_kwargs = (
                 dict(
+                    weight_dtype=torch.float32,
                     cast_x_before_out_mul=True,
-                    fp32_residual=False,
+                    override_orig_dtype=torch.float32,
+                    fp32_residual=True,
                 )
                 if get_global_server_args().rl_on_policy_target is not None
                 else {}
