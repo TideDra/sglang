@@ -1104,8 +1104,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         self.traj_map.pop(request.traj_id)
                     return self.create_error_response(
                         "Request aborted",
-                        err_type="InternalServerError",
-                        status_code=500,
+                        err_type="Gone",
+                        status_code=410,
                     )
                 traj = self.traj_map[request.traj_id]
                 output_tokens = ret_item["output_ids"]
