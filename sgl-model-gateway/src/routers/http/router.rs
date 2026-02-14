@@ -907,7 +907,7 @@ impl RouterTrait for Router {
 
         if self.traj_map.contains_key(traj_id) {
             let trajectory = self.traj_map.get(traj_id).unwrap().value().clone();
-            return Json(json!({ "trajectory": trajectory["cached_request"], "token_ids": trajectory["cached_token_ids"], "output_token_mask": trajectory["output_token_mask"], "token_logprobs": trajectory["cached_token_logprobs"] })).into_response();
+            return Json(json!({ "trajectory": trajectory["cached_request"], "token_ids": trajectory["cached_token_ids"], "output_token_mask": trajectory["output_token_mask"], "token_logprobs": trajectory["cached_token_logprobs"], "routed_experts": trajectory["cached_routed_experts"] })).into_response();
         } else {
             return error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id));
         }
