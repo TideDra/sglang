@@ -935,6 +935,7 @@ fn validate_responses_cross_parameters(
                 item,
                 ResponseInputOutputItem::Message { .. }
                     | ResponseInputOutputItem::SimpleInputMessage { .. }
+                    | ResponseInputOutputItem::FunctionCallOutput { .. }
             )
         });
 
@@ -1163,7 +1164,7 @@ pub struct ResponsesResponse {
 
     /// Tool choice setting
     #[serde(default = "default_tool_choice")]
-    pub tool_choice: String,
+    pub tool_choice: ToolChoice,
 
     /// Available tools
     #[serde(default)]
@@ -1198,8 +1199,8 @@ fn default_object_type() -> String {
     "response".to_string()
 }
 
-fn default_tool_choice() -> String {
-    "auto".to_string()
+fn default_tool_choice() -> ToolChoice {
+    ToolChoice::Value(ToolChoiceValue::Auto)
 }
 
 impl ResponsesResponse {

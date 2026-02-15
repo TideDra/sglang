@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::protocols::responses::*;
-
+use crate::protocols::common::{ToolChoice, ToolChoiceValue};
 /// Builder for ResponsesResponse
 ///
 /// Provides a fluent interface for constructing responses with sensible defaults.
@@ -30,7 +30,7 @@ pub struct ResponsesResponseBuilder {
     store: bool,
     temperature: Option<f32>,
     text: Option<TextConfig>,
-    tool_choice: String,
+    tool_choice: ToolChoice,
     tools: Vec<ResponseTool>,
     top_p: Option<f32>,
     truncation: Option<String>,
@@ -64,7 +64,7 @@ impl ResponsesResponseBuilder {
             store: true,
             temperature: None,
             text: None,
-            tool_choice: "auto".to_string(),
+            tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
             tools: Vec::new(),
             top_p: None,
             truncation: None,
@@ -91,9 +91,9 @@ impl ResponsesResponseBuilder {
         self.store = request.store.unwrap_or(true);
         self.temperature = request.temperature;
         self.tool_choice = if let Some(ref tc) = request.tool_choice {
-            serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string())
+            tc.clone()
         } else {
-            "auto".to_string()
+            ToolChoice::Value(ToolChoiceValue::Auto)
         };
         self.tools = request.tools.clone().unwrap_or_default();
         self.top_p = request.top_p;
@@ -195,8 +195,8 @@ impl ResponsesResponseBuilder {
     }
 
     /// Set tool choice setting
-    pub fn tool_choice(mut self, tool_choice: impl Into<String>) -> Self {
-        self.tool_choice = tool_choice.into();
+    pub fn tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = tool_choice;
         self
     }
 

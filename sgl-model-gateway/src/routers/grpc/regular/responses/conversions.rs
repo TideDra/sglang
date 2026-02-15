@@ -349,7 +349,7 @@ pub fn chat_to_responses(
                 .and_then(|d| d.reasoning_tokens),
             prompt_tokens_details: None, // Chat response doesn't have this
         };
-        ResponsesUsage::Classic(usage_info)
+        ResponsesUsage::Modern(usage_info.to_response_usage())
     });
 
     // Generate response
