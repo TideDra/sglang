@@ -261,3 +261,7 @@ outputs/
 
 # setuptools-scm generated version file
 python/sglang/_version.py
+
+*.ipynb
+*.sh
+ckpts
