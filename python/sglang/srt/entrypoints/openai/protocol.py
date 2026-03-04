@@ -563,7 +563,7 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
-    return_routed_experts: bool = True
+    return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
