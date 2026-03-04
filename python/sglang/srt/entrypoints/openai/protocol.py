@@ -563,7 +563,7 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
-    return_routed_experts: bool = False
+    return_routed_experts: bool = True
     return_cached_tokens_details: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
@@ -1400,6 +1400,7 @@ class Trajectory(BaseModel):
     cached_token_ids: Optional[List[int]] = None
     output_token_mask: Optional[List[int]] = None
     cached_token_logprobs: Optional[List[float]] = None
+    cached_routed_experts: Optional[str] = None
     cached_request: Optional[ChatCompletionRequest] = None
     cached_tools_text: Optional[str] = None
     eos_token_id: Optional[int] = None
