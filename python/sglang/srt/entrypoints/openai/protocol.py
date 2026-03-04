@@ -1399,6 +1399,7 @@ ResponseInputOutputItem: TypeAlias = Union[
 class Trajectory(BaseModel):
     cached_token_ids: Optional[List[int]] = None
     output_token_mask: Optional[List[int]] = None
+    cached_token_logprobs: Optional[List[float]] = None
     cached_request: Optional[ChatCompletionRequest] = None
     cached_tools_text: Optional[str] = None
     eos_token_id: Optional[int] = None
