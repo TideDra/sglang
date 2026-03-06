@@ -332,7 +332,6 @@ class OpenAIServingChat(OpenAIServingBase):
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
-            return_routed_experts=request.return_routed_experts,
         )
 
         return adapted_request, request
