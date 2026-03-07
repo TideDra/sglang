@@ -426,12 +426,55 @@ class OpenAIServingChat(OpenAIServingBase):
                             tools,
                             is_multimodal,
                             add_generation_prompt=False,
+                            skip_last_assistant_handling=True,
                         )
                         cached_prompt_ids_len = len(cached_result.prompt_ids)
                         if (
                             result.prompt_ids[:cached_prompt_ids_len]
                             != cached_result.prompt_ids
                         ):
+                            # Debug: find first divergence point
+                            _tokenizer = self.tokenizer_manager.tokenizer
+                            _min_len = min(
+                                cached_prompt_ids_len, len(result.prompt_ids)
+                            )
+                            _diverge = next(
+                                (
+                                    i
+                                    for i in range(_min_len)
+                                    if result.prompt_ids[i]
+                                    != cached_result.prompt_ids[i]
+                                ),
+                                _min_len,
+                            )
+                            _ctx = 20
+                            logger.error(
+                                "Trajectory prefix mismatch at token %d "
+                                "(cached_len=%d, new_len=%d)\n"
+                                "  cached[%d:%d] = %r\n"
+                                "  new   [%d:%d] = %r\n"
+                                "  cached_request last msg = %s",
+                                _diverge,
+                                cached_prompt_ids_len,
+                                len(result.prompt_ids),
+                                max(0, _diverge - _ctx),
+                                _diverge + _ctx,
+                                _tokenizer.decode(
+                                    cached_result.prompt_ids[
+                                        max(0, _diverge - _ctx) : _diverge + _ctx
+                                    ]
+                                ),
+                                max(0, _diverge - _ctx),
+                                _diverge + _ctx,
+                                _tokenizer.decode(
+                                    result.prompt_ids[
+                                        max(0, _diverge - _ctx) : _diverge + _ctx
+                                    ]
+                                ),
+                                traj.cached_request.messages[-1].model_dump()
+                                if traj.cached_request.messages
+                                else "N/A",
+                            )
                             raise ValueError(
                                 "The new prompt does not start with the cached prompt"
                             )
@@ -482,6 +525,7 @@ class OpenAIServingChat(OpenAIServingBase):
         tools: Optional[List[Dict]],
         is_multimodal: bool,
         add_generation_prompt: bool = True,
+        skip_last_assistant_handling: bool = False,
     ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
         prompt = ""
@@ -518,9 +562,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 msg.update(processed_msg)
 
             # Handle continue_final_message: separate final assistant message
-            messages, assistant_prefix = self._handle_last_assistant_message(
-                messages, request
-            )
+            if skip_last_assistant_handling:
+                assistant_prefix = None
+            else:
+                messages, assistant_prefix = self._handle_last_assistant_message(
+                    messages, request
+                )
 
             if messages[0]["role"] != "system":
                 # insert an empty system prompt to help render tool system prompt
@@ -572,9 +619,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 openai_compatible_messages.append(processed_msg)
 
             # Handle continue_final_message: separate final assistant message
-            openai_compatible_messages, assistant_prefix = (
-                self._handle_last_assistant_message(openai_compatible_messages, request)
-            )
+            if skip_last_assistant_handling:
+                assistant_prefix = None
+            else:
+                openai_compatible_messages, assistant_prefix = (
+                    self._handle_last_assistant_message(
+                        openai_compatible_messages, request
+                    )
+                )
 
             try:
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
@@ -1088,7 +1140,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text if reasoning_text else None,
                 ),
-                logprobs=None, # we get logprobs from the trajectory
+                logprobs=None,  # we get logprobs from the trajectory
                 finish_reason=finish_reason["type"] if finish_reason else None,
                 matched_stop=(
                     finish_reason["matched"]
