@@ -1,4 +1,5 @@
 from transformers import PretrainedConfig
+from transformers.configuration_utils import layer_type_validation
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
@@ -29,6 +30,18 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
 
         # Keep both names for compatibility with model code paths that read either.
         self.rope_parameters = rope_parameters or self.rope_scaling
+
+        self.rope_theta = self.rope_scaling.get("rope_theta", 10000000)
+        self.layer_types = kwargs.get("layer_types", None)
+        if self.layer_types is None:
+            interval_pattern = kwargs.get("full_attention_interval", 4)
+            self.layer_types = [
+                "linear_attention"
+                if bool((i + 1) % interval_pattern)
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
+        layer_type_validation(self.layer_types, self.num_hidden_layers)
 
 
 class Qwen3_5Config(PretrainedConfig):

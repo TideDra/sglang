@@ -1164,9 +1164,34 @@ class OpenAIServingChat(OpenAIServingBase):
                 traj.cached_token_ids.extend(output_tokens)
                 traj.output_token_mask.extend([1] * len(output_tokens))
                 if choice_logprobs:
-                    traj.cached_token_logprobs.extend(
-                        [x.logprob for x in choice_logprobs.content]
-                    )
+                    logprob_values = [x.logprob for x in choice_logprobs.content]
+                    if len(logprob_values) != len(output_tokens):
+                        _tokenizer = self.tokenizer_manager.tokenizer
+                        # Decode the logprob tokens (what logprobs cover)
+                        logprob_token_texts = [x.token for x in choice_logprobs.content]
+                        # Decode output_tokens to see what they are
+                        output_decoded = _tokenizer.decode(output_tokens)
+                        # Raw output_token_logprobs from meta_info
+                        raw_logprobs = ret_item["meta_info"].get(
+                            "output_token_logprobs", []
+                        )
+                        logger.error(
+                            f"[traj debug] logprobs/output_ids length mismatch: "
+                            f"len(logprob_values)={len(logprob_values)}, "
+                            f"len(output_tokens)={len(output_tokens)}, "
+                            f"len(raw_output_token_logprobs)={len(raw_logprobs)}, "
+                            f"finish_reason={finish_reason}, "
+                            f"request.logprobs={request.logprobs}, "
+                            f"traj_id={request.traj_id}, "
+                            f"logprob_token_texts={logprob_token_texts}, "
+                            f"output_tokens_first10={output_tokens[:10]}, "
+                            f"output_tokens_last10={output_tokens[-10:]}, "
+                            f"output_decoded_first200={output_decoded[:200]!r}, "
+                            f"output_decoded_last200={output_decoded[-200:]!r}, "
+                            f"completion_tokens={ret_item['meta_info'].get('completion_tokens')}, "
+                            f"text_len={len(text) if text else 0}"
+                        )
+                    traj.cached_token_logprobs.extend(logprob_values)
                 else:
                     traj.cached_token_logprobs.extend([0] * len(output_tokens))
                 if traj.cached_token_ids[-1] != traj.eos_token_id:
