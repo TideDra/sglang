@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
+    compute_entropy_chunked,
     compute_temp_top_p_normalized_logprobs,
     get_token_ids_logprobs_chunk,
     get_token_ids_logprobs_prefill,
@@ -84,6 +85,12 @@ class LogitsProcessorOutput:
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
+    # Per-sequence entropy of the output token distribution. shape: [#seq]
+    next_token_entropy: Optional[torch.Tensor] = None
+
+    ## Part 4: Prefill-only entropy
+    # Per-token entropy of the input token distribution. shape: [#token] (flattened across all seqs)
+    input_token_entropy: Optional[torch.Tensor] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]
@@ -116,6 +123,7 @@ class LogitsMetadata:
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
     extend_token_ids_logprob: bool = False
+    extend_return_entropy: bool = False
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
@@ -184,6 +192,7 @@ class LogitsMetadata:
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
+            extend_return_entropy=forward_batch.return_entropy,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
@@ -366,10 +375,15 @@ class LogitsProcessor(nn.Module):
         )
 
         if should_skip_chunking:
-            # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            # Compute logits in native dtype (bf16) to save memory; only
+            # sampled_logits (typically 1 row per sequence) are cast to float32.
+            logits = self._get_logits(
+                pruned_states, lm_head, logits_metadata, cast_to_float32=False
+            )
             sampled_logits = (
-                logits[sample_indices] if sample_indices is not None else logits
+                logits[sample_indices].float()
+                if sample_indices is not None
+                else logits.float()
             )
             input_logits = logits[input_logprob_indices]
             del logits
@@ -393,6 +407,7 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
             input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
+            input_token_entropy=logprobs_result.input_token_entropy,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
 
@@ -633,12 +648,17 @@ class LogitsProcessor(nn.Module):
             logits_metadata.extend_input_logprob_token_ids_gpu,
         ]
 
+        input_token_entropy = None
+        if logits_metadata.extend_return_entropy:
+            input_token_entropy = compute_entropy_chunked(input_logprobs)
+
         return InputLogprobsResult(
             input_token_logprobs=input_token_logprobs,
             input_top_logprobs_val=input_top_logprobs_val,
             input_top_logprobs_idx=input_top_logprobs_idx,
             input_token_ids_logprobs_val=input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+            input_token_entropy=input_token_entropy,
         )
 
     def process_input_logprobs_by_chunk(
@@ -666,6 +686,7 @@ class LogitsProcessor(nn.Module):
         num_chunks = (total_size + chunk_size - 1) // chunk_size
 
         input_token_logprobs = []
+        input_token_entropy_list = [] if logits_metadata.extend_return_entropy else None
         if logits_metadata.extend_return_top_logprob:
             input_top_logprobs_val = []
             input_top_logprobs_idx = []
@@ -698,15 +719,20 @@ class LogitsProcessor(nn.Module):
             # This is needed to correctly index into extend_input_logprob_token_ids_gpu
             mask_indices = torch.nonzero(chunk_mask, as_tuple=True)[0]
 
-            # Get the logits for this chunk
+            # Get the logits for this chunk in native dtype (bf16) to save memory.
+            # The float32 cast is deferred: sampled_logits are cast after extraction
+            # (only a few rows), and input logprobs are computed in bf16 then cast
+            # to float32 inside log_softmax / entropy helpers.
             chunk_states = pruned_states[start_idx:end_idx]
-            chunk_logits = self._get_logits(chunk_states, lm_head, logits_metadata)
+            chunk_logits = self._get_logits(
+                chunk_states, lm_head, logits_metadata, cast_to_float32=False
+            )
 
-            # Initialize sampled_logits on first chunk
+            # Initialize sampled_logits on first chunk (always float32 for the sampler)
             if i == 0:
                 sampled_logits = torch.empty(
                     (sample_indices.shape[0], chunk_logits.shape[1]),
-                    dtype=chunk_logits.dtype,
+                    dtype=torch.float32,
                     device=chunk_logits.device,
                 )
 
@@ -717,7 +743,9 @@ class LogitsProcessor(nn.Module):
             )
             if chunk_sample_mask.any():
                 chunk_sample_indices = sample_indices[chunk_sample_mask] - start_idx
-                sampled_logits[chunk_sample_mask] = chunk_logits[chunk_sample_indices]
+                sampled_logits[chunk_sample_mask] = chunk_logits[
+                    chunk_sample_indices
+                ].float()
 
             # If there are no input logprobs in this chunk, skip the rest
             if chunk_indices.numel() == 0:
@@ -792,8 +820,18 @@ class LogitsProcessor(nn.Module):
             ]
             input_token_logprobs.append(chunk_input_token_logprobs)
 
+            if logits_metadata.extend_return_entropy:
+                input_token_entropy_list.append(
+                    compute_entropy_chunked(chunk_input_logprobs)
+                )
+
         # Concatenate the results
         input_token_logprobs = torch.cat(input_token_logprobs, dim=0)
+        input_token_entropy = (
+            torch.cat(input_token_entropy_list, dim=0)
+            if input_token_entropy_list is not None
+            else None
+        )
 
         return (
             InputLogprobsResult(
@@ -802,6 +840,7 @@ class LogitsProcessor(nn.Module):
                 input_top_logprobs_idx=input_top_logprobs_idx,
                 input_token_ids_logprobs_val=input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+                input_token_entropy=input_token_entropy,
             ),
             sampled_logits,
         )
@@ -812,12 +851,20 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
+        cast_to_float32: bool = True,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
         If sampled_logits_only is True, it means hidden_states only contain the
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
+
+        Args:
+            cast_to_float32: If False, skip the bfloat16→float32 cast in
+                _copy_logits_to_buffer, keeping logits in the model's native
+                dtype. This significantly reduces peak memory (2x) and is used
+                by the chunked-logprobs path where float32 precision is not
+                needed for intermediate logits.
         """
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
@@ -838,7 +885,9 @@ class LogitsProcessor(nn.Module):
             logits, local_hidden_states, logits_metadata
         )
 
-        logits = self._copy_logits_to_buffer(logits, logits_metadata)
+        logits = self._copy_logits_to_buffer(
+            logits, logits_metadata, cast_to_float32=cast_to_float32
+        )
 
         if self.final_logit_softcapping:
             if not _is_npu:
@@ -946,7 +995,10 @@ class LogitsProcessor(nn.Module):
         return logits
 
     def _copy_logits_to_buffer(
-        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+        self,
+        logits: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+        cast_to_float32: bool = True,
     ) -> torch.Tensor:
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
@@ -954,7 +1006,9 @@ class LogitsProcessor(nn.Module):
             logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
         else:
-            logits = logits[:, : self.vocab_size].float()
+            logits = logits[:, : self.vocab_size]
+            if cast_to_float32:
+                logits = logits.float()
         return logits
 
     def _get_dllm_logits(

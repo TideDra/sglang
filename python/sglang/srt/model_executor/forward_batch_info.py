@@ -373,6 +373,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # Whether to return entropy of the output token distribution
+    return_entropy: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -417,6 +420,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            return_entropy=batch.return_entropy,
         )
         device = model_runner.device
 

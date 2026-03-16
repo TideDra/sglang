@@ -1039,6 +1039,8 @@ class BatchTokenIDOutput(
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # Per-req list of per-input-token entropies (None per req if not requested)
+    input_token_entropy_val: Optional[List[Optional[List[float]]]] = None
 
 
 @dataclass
@@ -1130,6 +1132,8 @@ class BatchStrOutput(
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # Per-req list of per-input-token entropies (None per req if not requested)
+    input_token_entropy_val: Optional[List[Optional[List[float]]]] = None
 
 
 @dataclass

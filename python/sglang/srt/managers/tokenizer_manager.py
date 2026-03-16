@@ -944,6 +944,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
+                return_entropy=obj.return_entropy,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
@@ -1550,6 +1551,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
+            if (
+                getattr(recv_obj, "output_token_entropy_val", None) is not None
+                and recv_obj.output_token_entropy_val[i]
+            ):
+                meta_info["output_token_entropy"] = recv_obj.output_token_entropy_val[i]
+            if (
+                getattr(recv_obj, "input_token_entropy_val", None) is not None
+                and recv_obj.input_token_entropy_val[i]
+            ):
+                meta_info["input_token_entropy"] = recv_obj.input_token_entropy_val[i]
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]

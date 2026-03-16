@@ -2574,6 +2574,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
+            return_entropy=forward_batch.return_entropy,
         )
         return next_token_ids
 

@@ -81,6 +81,7 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
+        return_entropy: bool = False,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -95,6 +96,7 @@ class Sampler(nn.Module):
                 sequence in the batch. This is used in speculative decoding.
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
+            return_entropy: If set, compute and store per-token entropy to logits_output.
         """
         logits = logits_output.next_token_logits
 

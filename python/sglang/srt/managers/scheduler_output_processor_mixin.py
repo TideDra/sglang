@@ -155,6 +155,10 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
+            if batch.return_entropy and logits_output.input_token_entropy is not None:
+                logits_output.input_token_entropy = tuple(
+                    logits_output.input_token_entropy.tolist()
+                )
 
             hidden_state_offset = 0
 
@@ -483,6 +487,11 @@ class SchedulerOutputProcessorMixin:
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
+            if req.return_entropy and logits_output.next_token_entropy is not None:
+                req.output_token_entropy_val.append(
+                    logits_output.next_token_entropy[i].item()
+                )
+
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
@@ -575,6 +584,14 @@ class SchedulerOutputProcessorMixin:
         else:
             # Regular request: add None at start, remove last (sampling token)
             req.input_token_logprobs_val = [None] + input_token_logprobs[:-1]
+
+        # Shift entropy to align with logprobs: entropy[i] should be the entropy
+        # of the distribution that generated token_i, not the distribution at position i.
+        if req.return_entropy and req.input_token_entropy_val:
+            if not is_multi_item_scoring:
+                req.input_token_entropy_val = [None] + list(
+                    req.input_token_entropy_val[:-1]
+                )
 
         # Process logprob indices based on scoring type
         if is_multi_item_scoring:
@@ -757,6 +774,15 @@ class SchedulerOutputProcessorMixin:
         ]
         req.input_token_logprobs.extend(input_token_logprobs)
 
+        if (
+            req.return_entropy
+            and output.input_token_entropy is not None
+            and num_input_logprobs > 0
+        ):
+            req.input_token_entropy_val.extend(
+                output.input_token_entropy[logprob_pt : logprob_pt + num_input_logprobs]
+            )
+
         if req.top_logprobs_num > 0:
             req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
             req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
@@ -916,6 +942,8 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         routed_experts = None
         customized_info = {}
+        output_token_entropy_val = []
+        input_token_entropy_val = []
 
         queue_times = []
         forward_entry_times = []
@@ -1026,6 +1054,18 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
 
                 retraction_counts.append(req.retraction_count)
+
+                # Collect entropy values for this req (may be empty list if not requested)
+                output_token_entropy_val.append(
+                    req.output_token_entropy_val[send_token_offset:]
+                    if req.return_entropy and req.output_token_entropy_val is not None
+                    else []
+                )
+                input_token_entropy_val.append(
+                    req.input_token_entropy_val
+                    if req.return_entropy and req.input_token_entropy_val is not None
+                    else []
+                )
 
                 queue_times.append(req.time_stats.get_queueing_time())
                 forward_entry_times.append(req.time_stats.forward_entry_time)
@@ -1173,7 +1213,16 @@ class SchedulerOutputProcessorMixin:
                     input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
                     output_token_ids_logprobs_val=output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
-                    output_token_entropy_val=None,
+                    output_token_entropy_val=(
+                        output_token_entropy_val
+                        if any(output_token_entropy_val)
+                        else None
+                    ),
+                    input_token_entropy_val=(
+                        input_token_entropy_val
+                        if any(input_token_entropy_val)
+                        else None
+                    ),
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
                     customized_info=customized_info,

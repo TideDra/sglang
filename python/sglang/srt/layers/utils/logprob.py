@@ -27,6 +27,71 @@ class InputLogprobsResult:
     input_top_logprobs_idx: Optional[List] = None
     input_token_ids_logprobs_val: Optional[List] = None
     input_token_ids_logprobs_idx: Optional[List] = None
+    # Per-token entropy of the input token distribution. shape: [n_input_tokens]
+    input_token_entropy: Optional[torch.Tensor] = None
+
+
+ENTROPY_CHUNK_SIZE = 256
+
+
+def compute_entropy_chunked(
+    logprobs: torch.Tensor, chunk_size: int = ENTROPY_CHUNK_SIZE
+) -> torch.Tensor:
+    """Memory-efficient per-row entropy from log-probabilities.
+
+    Processes rows in chunks to limit peak extra memory to
+    ~2 * chunk_size * vocab_size * sizeof(float32) instead of the full tensor.
+
+    Args:
+        logprobs: [N, vocab_size] log-probability tensor (any dtype).
+        chunk_size: rows per chunk.
+    Returns:
+        [N] float32 tensor of entropy values (nats).
+    """
+    N = logprobs.shape[0]
+    if N == 0:
+        return torch.empty(0, device=logprobs.device, dtype=torch.float32)
+    entropy = torch.empty(N, device=logprobs.device, dtype=torch.float32)
+    finfo_min = torch.finfo(torch.float32).min
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        lp = logprobs[start:end].float()
+        p = lp.exp()
+        lp.clamp_(min=finfo_min)
+        p.mul_(lp)
+        entropy[start:end] = -p.sum(dim=-1)
+        del lp, p
+    return entropy
+
+
+def compute_entropy_from_logits_chunked(
+    logits: torch.Tensor, chunk_size: int = ENTROPY_CHUNK_SIZE
+) -> torch.Tensor:
+    """Memory-efficient per-row entropy directly from logits.
+
+    Performs log_softmax -> entropy per chunk so the full [N, V] float32
+    log_softmax output is never materialised.
+
+    Args:
+        logits: [N, vocab_size] logit tensor (may already be temperature-scaled).
+        chunk_size: rows per chunk.
+    Returns:
+        [N] float32 tensor of entropy values (nats).
+    """
+    N = logits.shape[0]
+    if N == 0:
+        return torch.empty(0, device=logits.device, dtype=torch.float32)
+    entropy = torch.empty(N, device=logits.device, dtype=torch.float32)
+    finfo_min = torch.finfo(torch.float32).min
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        lp = torch.log_softmax(logits[start:end].float(), dim=-1)
+        p = lp.exp()
+        lp.clamp_(min=finfo_min)
+        p.mul_(lp)
+        entropy[start:end] = -p.sum(dim=-1)
+        del lp, p
+    return entropy
 
 
 def compute_temp_top_p_normalized_logprobs(
