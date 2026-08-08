@@ -342,6 +342,20 @@ def get_config(
             "patch_size": 14,
         }
         config.vision_config = SiglipVisionConfig(**vision_config)
+    elif (
+        config.architectures is not None
+        and config.architectures[0] == "Phi3VForCausalLM"
+    ):
+        # Phi-3V predates the standardized LongRoPE name and does not expose
+        # its image placeholder ID in config.json.
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+            if rope_type == "su":
+                config.rope_scaling = dict(rope_scaling)
+                key = "rope_type" if "rope_type" in rope_scaling else "type"
+                config.rope_scaling[key] = "longrope"
+        config.image_token_id = 32044
     text_config = get_hf_text_config(config=config)
 
     if isinstance(model, str) and text_config is not None:
