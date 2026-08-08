@@ -26,7 +26,7 @@ use crate::{
 ///
 /// Replaces the regular PreparationStage for Harmony models.
 /// Converts chat/generate requests to Harmony-encoded token_ids and extraction_text.
-pub(crate) struct HarmonyPreparationStage {
+pub struct HarmonyPreparationStage {
     builder: HarmonyBuilder,
 }
 
@@ -387,9 +387,7 @@ impl HarmonyPreparationStage {
 /// - Without reasoning: triggers on `<|channel|>final` (goes directly to final channel)
 ///
 /// This is used for the Responses API text.format field (json_object or json_schema).
-pub(crate) fn build_text_format_structural_tag(
-    schema: &serde_json::Value,
-) -> Result<String, String> {
+pub fn build_text_format_structural_tag(schema: &serde_json::Value) -> Result<String, String> {
     let structural_tag = json!({
         "format": {
             "type": "triggered_tags",

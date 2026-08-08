@@ -11,18 +11,13 @@
 //! The ring is rebuilt only when workers are added/removed, not per-request.
 //! Uses virtual nodes (150 per worker) for even distribution and blake3 for stable hashing.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use dashmap::DashMap;
-use smg_mesh::OptionalMeshSyncManager;
 use uuid::Uuid;
 
 use crate::{
-    core::{
-        circuit_breaker::CircuitState,
-        worker::{HealthChecker, RuntimeType, WorkerType},
-        ConnectionMode, Worker,
-    },
+    core::{CircuitState, ConnectionMode, RuntimeType, Worker, WorkerType},
     observability::metrics::Metrics,
 };
 
@@ -57,16 +52,11 @@ impl HashRing {
         for worker in workers {
             // Create Arc<str> once per worker, share across all virtual nodes
             let url: Arc<str> = Arc::from(worker.url());
-            let url_bytes = url.as_bytes();
 
             // Create multiple virtual nodes per worker
             for vnode in 0..VIRTUAL_NODES_PER_WORKER {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(url_bytes);
-                hasher.update(b"#");
-                hasher.update(&(vnode as u64).to_le_bytes());
-                let hash = hasher.finalize();
-                let pos = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
+                let vnode_key = format!("{}#{}", url, vnode);
+                let pos = Self::hash_position(&vnode_key);
                 entries.push((pos, Arc::clone(&url)));
             }
         }
@@ -197,10 +187,6 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
-    /// Optional mesh sync manager for state synchronization
-    /// When None, the registry works independently without mesh synchronization
-    /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
-    mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
 }
 
 impl WorkerRegistry {
@@ -213,7 +199,6 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
-            mesh_sync: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -231,11 +216,6 @@ impl WorkerRegistry {
     /// Get the hash ring for a model (O(1) lookup)
     pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
         self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
-    }
-
-    /// Set mesh sync manager (thread-safe, can be called after initialization)
-    pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
-        *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
     /// Register a new worker
@@ -281,17 +261,6 @@ impl WorkerRegistry {
             .entry(worker.connection_mode().clone())
             .or_default()
             .push(worker_id.clone());
-
-        // Sync to mesh if enabled (no-op if mesh is not enabled)
-        if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
-            mesh_sync.sync_worker_state(
-                worker_id.as_str().to_string(),
-                worker.model_id().to_string(),
-                worker.url().to_string(),
-                worker.is_healthy(),
-                0.0, // TODO: Get actual load
-            );
-        }
 
         worker_id
     }
@@ -349,11 +318,6 @@ impl WorkerRegistry {
             worker.set_healthy(false);
             Metrics::remove_worker_metrics(worker.url());
 
-            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
-            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
-                mesh_sync.remove_worker_state(worker_id.as_str());
-            }
-
             Some(worker)
         } else {
             None
@@ -398,25 +362,6 @@ impl WorkerRegistry {
             .get(worker_type)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
             .unwrap_or_default()
-    }
-
-    /// Update worker health status and sync to mesh
-    pub fn update_worker_health(&self, worker_id: &WorkerId, is_healthy: bool) {
-        if let Some(worker) = self.workers.get(worker_id) {
-            // Update worker health (if Worker trait has a method for this)
-            // For now, we'll just sync to mesh
-
-            // Sync to mesh if enabled (no-op if mesh is not enabled)
-            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
-                mesh_sync.sync_worker_state(
-                    worker_id.as_str().to_string(),
-                    worker.model_id().to_string(),
-                    worker.url().to_string(),
-                    is_healthy,
-                    0.0, // TODO: Get actual load
-                );
-            }
-        }
     }
 
     /// Get all prefill workers (regardless of bootstrap_port)
@@ -643,7 +588,7 @@ impl WorkerRegistry {
 
     /// Start a health checker for all workers in the registry
     /// This should be called once after the registry is populated with workers
-    pub(crate) fn start_health_checker(&self, check_interval_secs: u64) -> HealthChecker {
+    pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
         use std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -676,7 +621,6 @@ impl WorkerRegistry {
                 // This is especially important when there are many workers
                 let health_futures: Vec<_> = workers
                     .iter()
-                    .filter(|worker| !worker.metadata().health_config.disable_health_check)
                     .map(|worker| {
                         let worker = worker.clone();
                         async move {
@@ -688,7 +632,7 @@ impl WorkerRegistry {
             }
         });
 
-        HealthChecker::new(handle, shutdown)
+        crate::core::HealthChecker::new(handle, shutdown)
     }
 }
 
@@ -732,7 +676,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::core::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
+    use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig};
 
     #[test]
     fn test_worker_registry() {
@@ -753,7 +697,7 @@ mod tests {
                 .build(),
         );
 
-        // Register worker
+        // Register worker (WorkerFactory returns Box<dyn Worker>, convert to Arc)
         let worker_id = registry.register(Arc::from(worker));
 
         assert!(registry.get(&worker_id).is_some());

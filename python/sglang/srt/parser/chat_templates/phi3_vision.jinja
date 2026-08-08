@@ -1,0 +1,22 @@
+{%- for message in messages %}
+{{- '<|' + message['role'] + '|>\n' -}}
+{%- if message['content'] is string %}
+{{- message['content'] -}}
+{%- else %}
+{%- for item in message['content'] %}
+{%- if item['type'] == 'image' %}
+{{- '<|image_1|>' -}}
+{%- elif item['type'] == 'text' %}
+{{- item['text'] -}}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{%- if message['role'] == 'assistant' %}
+{{- '<|end|><|endoftext|>\n' -}}
+{%- else %}
+{{- '<|end|>\n' -}}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt and messages[-1]['role'] != 'assistant' %}
+{{- '<|assistant|>\n' -}}
+{%- endif %}

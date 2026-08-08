@@ -27,17 +27,19 @@ pub mod worker_manager;
 pub mod worker_registry;
 pub mod worker_service;
 
-// Re-export commonly used types for convenience
-pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+pub use circuit_breaker::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
+};
 pub use error::{WorkerError, WorkerResult};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};
-pub use retry::{is_retryable_status, RetryExecutor};
+pub use model_type::{Endpoint, ModelType};
+pub use retry::{is_retryable_status, BackoffCalculator, RetryError, RetryExecutor};
 pub use worker::{
-    AttachedBody, BasicWorker, ConnectionMode, HealthConfig, RuntimeType, Worker, WorkerLoadGuard,
-    WorkerType,
+    attach_guards_to_response, worker_to_info, BasicWorker, ConnectionMode, DPAwareWorker,
+    HealthChecker, HealthConfig, RuntimeType, Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_manager::{LoadMonitor, WorkerManager};
-pub use worker_registry::{HashRing, WorkerRegistry};
-pub use worker_service::WorkerService;
+pub use worker_registry::{HashRing, WorkerId, WorkerRegistry, WorkerRegistryStats};
+pub use worker_service::{WorkerService, WorkerServiceError};

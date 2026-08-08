@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.multimodal.processors.phi3v import (
     IMAGE_TOKEN_ID,
     Phi3VMultimodalProcessor,
@@ -70,8 +71,46 @@ class TestPhi3VProcessor(unittest.TestCase):
             processor._single_image_processor.image_processor.num_crops, 16
         )
 
+    def test_trajectory_single_image_uses_stable_multi_image_crop_policy(self):
+        hf_processor = _FakePhi3VProcessor()
+        processor = object.__new__(Phi3VMultimodalProcessor)
+        processor._processor = hf_processor
+        processor._single_image_processor = _FakePhi3VProcessor(num_crops=16)
+        processor.server_args = SimpleNamespace(keep_mm_feature_on_device=False)
+        processor.FEATURE_NAMES = ["pixel_values"]
+
+        processor.process_mm_data(
+            "<|image_1|>",
+            images=[object()],
+            use_single_image_processor=False,
+        )
+
+        self.assertIsNotNone(hf_processor.call_kwargs)
+        self.assertIsNone(processor._single_image_processor.call_kwargs)
+
 
 class TestPhi3VConversation(unittest.TestCase):
+    def test_builtin_jinja_template_preserves_multimodal_content(self):
+        tokenizer = SimpleNamespace(chat_template=None)
+        tokenizer_manager = SimpleNamespace(
+            tokenizer=tokenizer,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="phi3_v")
+            ),
+        )
+        template_manager = TemplateManager()
+
+        template_manager.load_chat_template(
+            tokenizer_manager,
+            chat_template_arg=None,
+            model_path="microsoft/Phi-3.5-vision-instruct",
+        )
+
+        self.assertIsNone(template_manager.chat_template_name)
+        self.assertEqual(template_manager.jinja_template_content_format, "openai")
+        self.assertIn("<|image_1|>", tokenizer.chat_template)
+        self.assertIn("'<|end|>' + eos_token", tokenizer.chat_template)
+
     def test_model_template_match_and_prompt(self):
         self.assertEqual(
             get_conv_template_by_model_path("microsoft/Phi-3.5-vision-instruct"),

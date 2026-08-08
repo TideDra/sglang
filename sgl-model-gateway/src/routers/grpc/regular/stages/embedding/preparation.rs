@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-pub(crate) struct EmbeddingPreparationStage;
+pub struct EmbeddingPreparationStage;
 
 impl EmbeddingPreparationStage {
     pub fn new() -> Self {

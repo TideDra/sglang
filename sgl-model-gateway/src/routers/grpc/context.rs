@@ -4,18 +4,21 @@
 //! eliminating deep parameter passing chains and providing a single source of truth
 //! for request state.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::http::HeaderMap;
+use serde_json::Value;
+
+use dashmap::DashMap;
 
 use super::{
     client::GrpcClient,
-    proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
+    proto_wrapper::{ProtoEmbedComplete, ProtoGenerateComplete, ProtoRequest, ProtoStream},
 };
 use crate::{
-    core::{Worker, WorkerLoadGuard},
+    core::{attach_guards_to_response, Worker, WorkerLoadGuard},
     protocols::{
-        chat::{ChatCompletionRequest, ChatCompletionResponse},
+        chat::{ChatCompletionRequest, ChatCompletionResponse, Trajectory},
         classify::{ClassifyRequest, ClassifyResponse},
         embedding::{EmbeddingRequest, EmbeddingResponse},
         generate::{GenerateRequest, GenerateResponse},
@@ -31,14 +34,14 @@ use crate::{
 /// This is the single source of truth for all request state as it flows
 /// through the pipeline stages. Uses Rust's type system to enforce proper
 /// stage ordering at compile time.
-pub(crate) struct RequestContext {
+pub struct RequestContext {
     pub input: RequestInput,
     pub components: Arc<SharedComponents>,
     pub state: ProcessingState,
 }
 
 /// Immutable request input
-pub(crate) struct RequestInput {
+pub struct RequestInput {
     pub request_type: RequestType,
     pub headers: Option<HeaderMap>,
     pub model_id: Option<String>,
@@ -46,7 +49,7 @@ pub(crate) struct RequestInput {
 
 /// Request type variants
 /// Using Arc instead of Box to enable cheap cloning for background tasks
-pub(crate) enum RequestType {
+pub enum RequestType {
     Chat(Arc<ChatCompletionRequest>),
     Generate(Arc<GenerateRequest>),
     Responses(Arc<ResponsesRequest>),
@@ -55,17 +58,16 @@ pub(crate) enum RequestType {
 }
 
 /// Shared components (injected once at creation)
-pub(crate) struct SharedComponents {
+pub struct SharedComponents {
     pub tokenizer_registry: Arc<TokenizerRegistry>,
-    #[allow(dead_code)]
     pub tool_parser_factory: ToolParserFactory,
-    #[allow(dead_code)]
     pub reasoning_parser_factory: ReasoningParserFactory,
+    pub trajectory_map: DashMap<String, Trajectory>,
 }
 
 /// Mutable processing state (evolves through pipeline stages)
 #[derive(Default)]
-pub(crate) struct ProcessingState {
+pub struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 
@@ -93,7 +95,7 @@ pub(crate) struct ProcessingState {
 }
 
 /// Output from preparation stage (Step 1)
-pub(crate) struct PreparationOutput {
+pub struct PreparationOutput {
     /// Original text (for chat) or resolved text (for generate)
     pub original_text: Option<String>,
 
@@ -117,7 +119,6 @@ pub(crate) struct PreparationOutput {
     pub selection_text: Option<String>,
 
     /// Harmony messages for history tracking (Harmony only)
-    #[allow(dead_code)]
     pub harmony_messages: Option<Vec<super::harmony::HarmonyMessage>>,
 
     /// Stop token IDs for Harmony models
@@ -125,7 +126,7 @@ pub(crate) struct PreparationOutput {
 }
 
 /// Worker selection (Step 2)
-pub(crate) enum WorkerSelection {
+pub enum WorkerSelection {
     Single {
         worker: Arc<dyn Worker>,
     },
@@ -136,7 +137,7 @@ pub(crate) enum WorkerSelection {
 }
 
 /// Client selection (Step 3)
-pub(crate) enum ClientSelection {
+pub enum ClientSelection {
     Single {
         client: GrpcClient,
     },
@@ -148,44 +149,72 @@ pub(crate) enum ClientSelection {
 
 /// Dispatch metadata (Step 5)
 #[derive(Clone)]
-pub(crate) struct DispatchMetadata {
+pub struct DispatchMetadata {
     pub request_id: String,
     pub model: String,
     pub created: u64,
     pub weight_version: Option<String>,
+    pub is_streaming: bool,
 }
 
 /// Load guards for worker load tracking
 /// Automatically decrements load when dropped
-pub(crate) enum LoadGuards {
-    Single {
-        _guard: WorkerLoadGuard,
-    },
+pub enum LoadGuards {
+    Single(WorkerLoadGuard),
     Dual {
-        _prefill: WorkerLoadGuard,
-        _decode: WorkerLoadGuard,
+        prefill: WorkerLoadGuard,
+        decode: WorkerLoadGuard,
     },
 }
 
-impl LoadGuards {
-    pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
+impl From<&WorkerSelection> for LoadGuards {
+    fn from(selection: &WorkerSelection) -> Self {
         match selection {
-            WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::new(worker.clone(), headers),
-            },
+            WorkerSelection::Single { worker } => {
+                LoadGuards::Single(WorkerLoadGuard::new(worker.clone()))
+            }
             WorkerSelection::Dual { prefill, decode } => LoadGuards::Dual {
-                _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
-                _decode: WorkerLoadGuard::new(decode.clone(), headers),
+                prefill: WorkerLoadGuard::new(prefill.clone()),
+                decode: WorkerLoadGuard::new(decode.clone()),
             },
         }
     }
 }
 
+impl LoadGuards {
+    /// Attach these load guards to a Response, tying their lifetime to the response body.
+    ///
+    /// When the response body is fully consumed or dropped (e.g., client disconnects),
+    /// the guards are dropped and worker load is decremented automatically.
+    ///
+    /// This is the proper RAII pattern for SSE/streaming responses.
+    pub fn attach_to_response(
+        self,
+        response: axum::response::Response,
+    ) -> axum::response::Response {
+        let guards = match self {
+            LoadGuards::Single(guard) => vec![guard],
+            LoadGuards::Dual { prefill, decode } => vec![prefill, decode],
+        };
+
+        attach_guards_to_response(guards, response)
+    }
+}
+
 /// Response processing state (Step 6)
 #[derive(Default)]
-pub(crate) struct ResponseState {
+pub struct ResponseState {
     /// Stop sequence decoder
     pub stop_decoder: Option<StopSequenceDecoder>,
+
+    /// Per-index streaming state (for n>1 support)
+    pub streaming: StreamingState,
+
+    /// Collected responses (non-streaming)
+    pub collected: Option<Vec<ProtoGenerateComplete>>,
+
+    /// Collected embeddings (non-streaming)
+    pub collected_embeddings: Option<Vec<ProtoEmbedComplete>>,
 
     /// Execution result (streams from workers)
     pub execution_result: Option<ExecutionResult>,
@@ -195,6 +224,32 @@ pub(crate) struct ResponseState {
 
     /// Responses API iteration result (Harmony only, for tool loop orchestration)
     pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,
+
+    // Harmony-specific parser state
+    /// Harmony parser for non-streaming (single parser for all indices)
+    pub harmony_parser: Option<super::harmony::HarmonyParserAdapter>,
+
+    /// Harmony parsers for streaming (one per index for n>1 support)
+    pub harmony_parser_per_index: Option<HashMap<usize, super::harmony::HarmonyParserAdapter>>,
+}
+
+/// Streaming state (per-choice tracking)
+#[derive(Default)]
+pub struct StreamingState {
+    pub is_firsts: HashMap<u32, bool>,
+    pub stream_buffers: HashMap<u32, String>,
+    pub finish_reasons: HashMap<u32, String>,
+    pub matched_stops: HashMap<u32, Option<Value>>,
+    pub prompt_tokens: HashMap<u32, u32>,
+    pub completion_tokens: HashMap<u32, u32>,
+    pub cached_tokens: HashMap<u32, u32>,
+
+    // Parser state (lazy initialization per index)
+    pub reasoning_parsers:
+        HashMap<u32, Arc<std::sync::Mutex<Box<dyn crate::reasoning_parser::ReasoningParser>>>>,
+    pub tool_parsers:
+        HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn crate::tool_parser::ToolParser>>>>,
+    pub has_tool_calls: HashMap<u32, bool>,
 }
 
 impl RequestContext {
@@ -288,6 +343,11 @@ impl RequestContext {
         }
     }
 
+    /// Get reference to original request (type-safe)
+    pub fn request(&self) -> &RequestType {
+        &self.input.request_type
+    }
+
     /// Get chat request (panics if not chat)
     pub fn chat_request(&self) -> &ChatCompletionRequest {
         match &self.input.request_type {
@@ -320,11 +380,51 @@ impl RequestContext {
         }
     }
 
+    /// Get responses request (panics if not responses)
+    pub fn responses_request(&self) -> &ResponsesRequest {
+        match &self.input.request_type {
+            RequestType::Responses(req) => req.as_ref(),
+            _ => panic!("Expected responses request"),
+        }
+    }
+
     /// Get Arc clone of responses request (panics if not responses)
     pub fn responses_request_arc(&self) -> Arc<ResponsesRequest> {
         match &self.input.request_type {
             RequestType::Responses(req) => Arc::clone(req),
             _ => panic!("Expected responses request"),
+        }
+    }
+
+    /// Get embedding request (panics if not embedding)
+    pub fn embedding_request(&self) -> &EmbeddingRequest {
+        match &self.input.request_type {
+            RequestType::Embedding(req) => req.as_ref(),
+            _ => panic!("Expected embedding request"),
+        }
+    }
+
+    /// Get Arc clone of embedding request (panics if not embedding)
+    pub fn embedding_request_arc(&self) -> Arc<EmbeddingRequest> {
+        match &self.input.request_type {
+            RequestType::Embedding(req) => Arc::clone(req),
+            _ => panic!("Expected embedding request"),
+        }
+    }
+
+    /// Get classify request (panics if not classify)
+    pub fn classify_request(&self) -> &ClassifyRequest {
+        match &self.input.request_type {
+            RequestType::Classify(req) => req.as_ref(),
+            _ => panic!("Expected classify request"),
+        }
+    }
+
+    /// Get Arc clone of classify request (panics if not classify)
+    pub fn classify_request_arc(&self) -> Arc<ClassifyRequest> {
+        match &self.input.request_type {
+            RequestType::Classify(req) => Arc::clone(req),
+            _ => panic!("Expected classify request"),
         }
     }
 
@@ -348,8 +448,6 @@ impl RequestContext {
     }
 }
 
-/// Some methods are kept for API completeness even if currently unused.
-#[allow(dead_code)]
 impl WorkerSelection {
     pub fn is_dual(&self) -> bool {
         matches!(self, Self::Dual { .. })
@@ -404,9 +502,11 @@ impl WorkerSelection {
     }
 }
 
-/// Some methods are kept for API completeness even if currently unused.
-#[allow(dead_code)]
 impl ClientSelection {
+    pub fn is_dual(&self) -> bool {
+        matches!(self, Self::Dual { .. })
+    }
+
     pub fn single(&self) -> Option<&GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
@@ -417,6 +517,13 @@ impl ClientSelection {
     pub fn single_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
+            _ => None,
+        }
+    }
+
+    pub fn dual(&self) -> Option<(&GrpcClient, &GrpcClient)> {
+        match self {
+            Self::Dual { prefill, decode } => Some((prefill, decode)),
             _ => None,
         }
     }
@@ -459,7 +566,7 @@ impl ClientSelection {
 
 /// Result of request execution (streams from workers)
 /// Uses ProtoStream to automatically abort on cancellation
-pub(crate) enum ExecutionResult {
+pub enum ExecutionResult {
     Single {
         stream: ProtoStream,
     },
@@ -475,7 +582,7 @@ pub(crate) enum ExecutionResult {
 
 /// Final processed response
 #[derive(Debug)]
-pub(crate) enum FinalResponse {
+pub enum FinalResponse {
     Chat(ChatCompletionResponse),
     /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
     Generate(Vec<GenerateResponse>),

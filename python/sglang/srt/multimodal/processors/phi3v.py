@@ -51,12 +51,14 @@ class Phi3VMultimodalProcessor(BaseMultimodalProcessor):
         if videos or audios:
             raise ValueError("Phi-3.5 Vision only supports image inputs")
 
+        use_single_image_processor = kwargs.pop("use_single_image_processor", True)
+
         # SGLang conversation templates use one static image placeholder. The
         # upstream Phi3V processor requires placeholders numbered 1..N.
         input_text = renumber_image_tokens(input_text)
         processor = (
             getattr(self, "_single_image_processor", self._processor)
-            if images is not None and len(images) == 1
+            if use_single_image_processor and images is not None and len(images) == 1
             else self._processor
         )
         result = processor(
@@ -94,7 +96,16 @@ class Phi3VMultimodalProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+            base_output,
+            self.mm_tokens,
+            # A trajectory may gain images on later turns. Phi normally changes
+            # from 16 crops for one image to 4 crops per image for multiple
+            # images, which changes the already-cached image-token span. Use the
+            # multi-image crop policy from the first tracked turn so cached raw
+            # token IDs and newly processed image embeddings stay aligned.
+            use_single_image_processor=not getattr(
+                request_obj, "return_input_ids", False
+            ),
         )
 
         return {

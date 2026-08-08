@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sglang-router"
-version = "0.3.2"
+version = "0.3.0"
 description = "High-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support"
 authors = [
     {name = "Simo Lin", email = "linsimo.mark@gmail.com"},
@@ -39,7 +39,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "requests>=2.25.0",
-    "pytest>=7.0.0",
 ]
 
 [project.scripts]
@@ -49,16 +48,7 @@ sglang-router = "sglang_router.cli:main"
 
 
 [tool.maturin]
-python-source = "src"
+python-source = "."
 module-name = "sglang_router.sglang_router_rs"
 # Exclude bindings/python/README.md to use root README only
 exclude = ["README.md"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
-markers = [
-    "unit: mark test as a unit test (no GPU required)",
-]

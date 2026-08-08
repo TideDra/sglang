@@ -15,7 +15,7 @@ use crate::routers::{
 };
 
 /// Request building stage for embedding requests
-pub(crate) struct EmbeddingRequestBuildingStage;
+pub struct EmbeddingRequestBuildingStage;
 
 impl EmbeddingRequestBuildingStage {
     pub fn new() -> Self {

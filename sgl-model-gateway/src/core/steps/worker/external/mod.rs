@@ -13,12 +13,10 @@ pub use discover_models::{
     group_models_into_cards, infer_model_type_from_id, DiscoverModelsStep, ModelInfo,
     ModelsResponse,
 };
-use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use super::shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep};
-use crate::{
-    app_context::AppContext, core::steps::workflow_data::ExternalWorkerWorkflowData,
-    protocols::worker_spec::WorkerConfigRequest,
+use crate::workflow::{
+    BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition,
 };
 
 /// Create external worker registration workflow definition.
@@ -37,7 +35,7 @@ use crate::{
 ///       │                         │
 ///       └────────────┴────────────┘
 /// ```
-pub fn create_external_worker_workflow() -> WorkflowDefinition<ExternalWorkerWorkflowData> {
+pub fn create_external_worker_workflow() -> WorkflowDefinition {
     WorkflowDefinition::new(
         "external_worker_registration",
         "External Worker Registration",
@@ -103,19 +101,4 @@ pub fn create_external_worker_workflow() -> WorkflowDefinition<ExternalWorkerWor
         .with_failure_action(FailureAction::FailWorkflow)
         .depends_on(&["register_workers"]),
     )
-}
-
-/// Helper to create initial workflow data for external worker registration
-pub fn create_external_worker_workflow_data(
-    config: WorkerConfigRequest,
-    app_context: Arc<AppContext>,
-) -> ExternalWorkerWorkflowData {
-    ExternalWorkerWorkflowData {
-        config,
-        model_cards: Vec::new(),
-        workers: None,
-        labels: std::collections::HashMap::new(),
-        app_context: Some(app_context),
-        actual_workers: None,
-    }
 }

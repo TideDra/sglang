@@ -3,30 +3,34 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::{stream, StreamExt};
+use futures_util::StreamExt;
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
-
+use dashmap::{DashMap, DashSet};
+use serde_json::{Value, json};
+use uuid::Uuid;
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        ConnectionMode, RetryExecutor, UNKNOWN_MODEL_ID, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, is_retryable_status
     },
     observability::{
         events::{self, Event},
-        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        metrics::{Metrics, bool_to_static_str, metrics_labels},
         otel_trace::inject_trace_context_http,
     },
     policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        chat::ChatCompletionRequest,
+        chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
         classify::ClassifyRequest,
         common::GenerationRequest,
         completion::CompletionRequest,
@@ -36,11 +40,22 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error::{self, extract_error_code_from_response},
-        grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        RouterTrait, error::{self, extract_error_code_from_response}, grpc::{regular::responses::conversions::{chat_to_responses, responses_to_chat}, utils::{error_type_from_status, route_to_endpoint}}, header_utils
     },
 };
+
+/// RAII guard to ensure traj_id is removed from processing set when dropped
+struct TrajLockGuard<'a> {
+    traj_id: String,
+    processing_set: &'a DashSet<String>,
+}
+
+impl<'a> Drop for TrajLockGuard<'a> {
+    fn drop(&mut self) {
+        self.processing_set.remove(&self.traj_id);
+        debug!("Released lock for traj_id={}", self.traj_id);
+    }
+}
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -50,6 +65,9 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
+    traj_map: DashMap<String, Value>,
+    traj_chain: DashMap<String, Vec<String>>,
+    processing_traj_ids: DashSet<String>,
 }
 
 impl std::fmt::Debug for Router {
@@ -75,6 +93,9 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
+            traj_map: DashMap::new(),
+            traj_chain: DashMap::new(),
+            processing_traj_ids: DashSet::new(),
         })
     }
 
@@ -88,6 +109,7 @@ impl Router {
         }
     }
 
+    // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
         let headers = header_utils::copy_request_headers(&req);
 
@@ -95,7 +117,10 @@ impl Router {
             Ok(worker_url) => {
                 let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
                 for (name, value) in headers {
-                    if header_utils::should_forward_request_header(&name) {
+                    // Use eq_ignore_ascii_case to avoid string allocation
+                    if !name.eq_ignore_ascii_case("content-type")
+                        && !name.eq_ignore_ascii_case("content-length")
+                    {
                         request_builder = request_builder.header(name, value);
                     }
                 }
@@ -130,7 +155,7 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
-    async fn select_worker_for_model(
+    fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
@@ -167,23 +192,21 @@ impl Router {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let idx = policy
-            .select_worker(
-                &available,
-                &SelectWorkerInfo {
-                    request_text: text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                    headers,
-                    hash_ring,
-                },
-            )
-            .await?;
+        let idx = policy.select_worker(
+            &available,
+            &SelectWorkerInfo {
+                request_text: text,
+                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                headers,
+                hash_ring,
+            },
+        )?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
             metrics_labels::CONNECTION_HTTP,
-            model_id.unwrap_or(UNKNOWN_MODEL_ID),
+            model_id.unwrap_or("default"),
             policy.name(),
         );
 
@@ -200,7 +223,7 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
-        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        let model = model_id.unwrap_or("default");
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -278,10 +301,7 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self
-            .select_worker_for_model(model_id, Some(text), headers)
-            .await
-        {
+        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
@@ -291,14 +311,15 @@ impl Router {
             }
         };
 
+        // Optional load tracking for cache-aware policy
+        // Get the policy for this model to check if it's cache-aware
         let policy = match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+        let load_guard =
+            (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -358,73 +379,58 @@ impl Router {
             return error::service_unavailable("no_workers", "No available workers");
         }
 
+        // Pre-filter headers once before the loop to avoid repeated lowercasing
         let filtered_headers: Vec<_> = headers
             .map(|hdrs| {
                 hdrs.iter()
-                    .filter(|(name, _)| header_utils::should_forward_request_header(name.as_str()))
+                    .filter(|(name, _)| {
+                        !name.as_str().eq_ignore_ascii_case("content-type")
+                            && !name.as_str().eq_ignore_ascii_case("content-length")
+                    })
                     .collect()
             })
             .unwrap_or_default();
 
-        let futures: Vec<_> = workers
-            .into_iter()
-            .map(|worker| {
-                let worker_url = worker.url();
-                let base = self.worker_base_url(worker_url);
-                let url = format!("{}/{}", base, endpoint);
-                let client = self.client.clone();
-                let method = method.clone();
-
-                let headers = filtered_headers.clone();
-
-                let api_key = worker.api_key().clone();
-
-                async move {
-                    let mut request_builder = match method {
-                        Method::GET => client.get(url),
-                        Method::POST => client.post(url),
-                        _ => {
-                            return Err(error::method_not_allowed(
-                                "unsupported_method",
-                                "Unsupported method for simple routing",
-                            ))
-                        }
-                    };
-
-                    if let Some(key) = api_key {
-                        let mut auth_header = String::with_capacity(7 + key.len());
-                        auth_header.push_str("Bearer ");
-                        auth_header.push_str(&key);
-                        request_builder = request_builder.header("Authorization", auth_header);
-                    }
-
-                    for (name, value) in headers {
-                        request_builder = request_builder.header(name.clone(), value.clone());
-                    }
-
-                    request_builder.send().await.map_err(convert_reqwest_error)
-                }
-            })
-            .collect();
-
-        // Now execute the collected futures concurrently
-        let mut stream = stream::iter(futures).buffer_unordered(32);
         let mut last_response: Option<Response> = None;
+        for worker in workers {
+            let worker_url = worker.url();
+            let base = self.worker_base_url(worker_url);
 
-        while let Some(result) = stream.next().await {
-            match result {
+            let url = format!("{}/{}", base, endpoint);
+            let mut request_builder = match method {
+                Method::GET => self.client.get(url),
+                Method::POST => self.client.post(url),
+                _ => {
+                    return error::method_not_allowed(
+                        "unsupported_method",
+                        "Unsupported method for simple routing",
+                    )
+                }
+            };
+
+            if let Some(api_key) = worker.api_key() {
+                // Pre-allocate string with capacity to avoid reallocation
+                let mut auth_header = String::with_capacity(7 + api_key.len());
+                auth_header.push_str("Bearer ");
+                auth_header.push_str(api_key);
+                request_builder = request_builder.header("Authorization", auth_header);
+            }
+
+            // Apply pre-filtered headers
+            for (name, value) in &filtered_headers {
+                request_builder = request_builder.header(*name, *value);
+            }
+
+            match request_builder.send().await {
                 Ok(res) => {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
                     let response_headers = header_utils::preserve_response_headers(res.headers());
-
                     match res.bytes().await {
                         Ok(body) => {
                             let mut response = Response::new(Body::from(body));
                             *response.status_mut() = status;
                             *response.headers_mut() = response_headers;
-
                             if status.is_success() {
                                 return response;
                             }
@@ -439,7 +445,7 @@ impl Router {
                     }
                 }
                 Err(e) => {
-                    last_response = Some(e);
+                    last_response = Some(convert_reqwest_error(e));
                 }
             }
         }
@@ -554,9 +560,11 @@ impl Router {
             request_builder = request_builder.header("Authorization", auth_header);
         }
 
+        // Copy all headers from original request if provided
         if let Some(headers) = headers {
             for (name, value) in headers {
-                if header_utils::should_forward_request_header(name.as_str()) {
+                // Skip Content-Type and Content-Length as .json() sets them
+                if *name != CONTENT_TYPE && *name != CONTENT_LENGTH {
                     request_builder = request_builder.header(name, value);
                 }
             }
@@ -633,7 +641,7 @@ impl Router {
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
             if let Some(guard) = load_guard {
-                response = AttachedBody::wrap_response(response, guard);
+                response = guard.attach_to_response(response);
             }
             response
         }
@@ -751,8 +759,189 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        if let Some(traj_id) = &body.traj_id {
+            // trajectory management only supported for non-streaming requests
+            if body.stream {
+                return error::bad_request(
+                    "trajectory_not_supported_for_streaming",
+                    "Trajectory management (traj_id) is not supported for streaming requests",
+                );
+            }
+
+            // Try to acquire exclusive lock for this traj_id
+            if !self.processing_traj_ids.insert(traj_id.clone()) {
+                // traj_id is already being processed by another request
+                return error::bad_request(
+                    "trajectory_locked",
+                    format!("Trajectory with id '{}' is currently being processed by another request", traj_id),
+                );
+            }
+
+            // Create RAII guard to ensure lock is released when function returns
+            let _lock_guard = TrajLockGuard {
+                traj_id: traj_id.clone(),
+                processing_set: &self.processing_traj_ids,
+            };
+
+            if !self.traj_map.contains_key(traj_id) {
+                // Initialize a new trajectory.
+                self.traj_map.insert(traj_id.clone(), json!({"cached_token_ids": null, "output_token_mask": null, "cached_request": null, "cached_tools_text": null, "eos_token_id": null, "cached_token_logprobs": null}));
+                self.traj_chain.insert(traj_id.clone(), vec![]);
+            }
+            // Clone the trajectory value and immediately drop the lock
+            let trajectory_value = self.traj_map.get(traj_id)
+                .expect("Unexpected error: traj not found")
+                .value()
+                .clone();
+            // Now the lock is released
+            drop(_lock_guard);
+            let mut new_body = body.clone();
+            new_body.trajectory = Some(trajectory_value);
+
+            let result = self.route_typed_request(headers, &new_body, "/v1/chat/completions", model_id).await;
+
+            // Extract and process response body
+            if result.status().is_success() {
+                let status = result.status();
+                let headers_clone = result.headers().clone();
+
+                // Extract response body (limit to 100MB for safety)
+                const MAX_BODY_SIZE: usize = 100 * 1024 * 1024; // 100MB
+                let body_bytes = match to_bytes(result.into_body(), MAX_BODY_SIZE).await {
+                    Ok(bytes) => {
+                        bytes
+                    }
+                    Err(e) => {
+                        error!("Failed to read response body: {}", e);
+                        return error::internal_error("read_response_body_failed", e.to_string());
+                    }
+                };
+
+                // Deserialize as JSON - must succeed
+                let mut json_data = match serde_json::from_slice::<Value>(&body_bytes) {
+                    Ok(data) => {
+                        data
+                    }
+                    Err(e) => {
+                        error!("Failed to parse response as JSON: {}", e);
+                        return error::internal_error("parse_response_json_failed", format!("Failed to parse response as JSON: {}", e));
+                    }
+                };
+
+                // Extract metadata - must exist
+                let metadata = match json_data.get_mut("metadata") {
+                    Some(meta) => {
+                        meta
+                    }
+                    None => {
+                        error!("Response missing metadata field");
+                        return error::internal_error("missing_metadata", "Response missing metadata field");
+                    }
+                };
+
+                // Extract trajectory - must exist
+                let trajectory = match metadata.get("trajectory") {
+                    Some(traj) => {
+                        traj
+                    }
+                    None => {
+                        error!("Response metadata missing trajectory field");
+                        return error::internal_error("missing_trajectory", "Response metadata missing trajectory field");
+                    }
+                };
+
+                // Update traj_map with the new trajectory
+                self.traj_map.insert(traj_id.clone(), trajectory.clone());
+
+                // Remove trajectory from response metadata
+                if let Some(obj) = metadata.as_object_mut() {
+                    obj.remove("trajectory");
+                }
+
+                // Serialize back to bytes - must succeed
+                let modified_body = match serde_json::to_vec(&json_data) {
+                    Ok(body) => {
+                        body
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize modified response: {}", e);
+                        return error::internal_error("serialize_response_failed", format!("Failed to serialize modified response: {}", e));
+                    }
+                };
+
+                let body_len = modified_body.len();
+                let mut response = Response::new(Body::from(modified_body));
+                *response.status_mut() = status;
+                *response.headers_mut() = headers_clone;
+
+                // Update Content-Length header to match the modified body size
+                response.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                response.headers_mut().insert(
+                    CONTENT_LENGTH,
+                    HeaderValue::from_str(&body_len.to_string()).unwrap(),
+                );
+
+                debug!("Returning response for traj_id={} with body_len={}", traj_id, body_len);
+                response
+            } else {
+                // For error responses, just return as-is
+                result
+            }
+        } else {
+            self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+                .await
+        }
+    }
+
+    async fn get_trajectory(&self, _headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        // Check if trajectory is currently being processed
+        if self.processing_traj_ids.contains(traj_id) {
+            return error::bad_request(
+                "trajectory_locked",
+                format!("Trajectory with id '{}' is currently being processed", traj_id),
+            );
+        }
+
+        if self.traj_map.contains_key(traj_id) {
+            let trajectory = self.traj_map.get(traj_id).unwrap().value().clone();
+            return Json(json!({ "trajectory": trajectory["cached_request"], "token_ids": trajectory["cached_token_ids"], "output_token_mask": trajectory["output_token_mask"], "token_logprobs": trajectory["cached_token_logprobs"], "routed_experts": trajectory["cached_routed_experts"] })).into_response();
+        } else {
+            return error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id));
+        }
+    }
+
+    async fn delete_trajectory(&self, _headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        // Check if trajectory is currently being processed
+        if self.processing_traj_ids.contains(traj_id) {
+            return error::bad_request(
+                "trajectory_locked",
+                format!("Trajectory with id '{}' is currently being processed, cannot delete", traj_id),
+            );
+        }
+
+        if self.traj_map.contains_key(traj_id) {
+            // Clone children list before recursion to avoid holding the lock during recursive calls
+            let children = self.traj_chain.get(traj_id)
+                .expect("Unexpected error: traj chain not found")
+                .value()
+                .clone();
+
+            // Now we can safely iterate and recursively delete without holding the lock
+            for c in children.iter() {
+                let response = self.delete_trajectory(_headers, c.as_str()).await;
+                if !response.status().is_success() {
+                    return response;
+                }
+            }
+            self.traj_map.remove(traj_id);
+            self.traj_chain.remove(traj_id);
+            return Json(serde_json::json!({ "message": "Trajectory deleted" })).into_response();
+        } else {
+            return error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id));
+        }
     }
 
     async fn route_completion(
@@ -771,8 +960,219 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
-            .await
+        let traj_id = match &body.previous_response_id {
+            Some(id) => {
+                if !self.traj_map.contains_key(id) {
+                    return error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", id));
+                }
+                id
+            },
+            None => &format!("resp_{}", Uuid::new_v4()), // Root node. Will not be used by user.
+        };
+
+        if body.stream.unwrap_or(false) {
+            return error::bad_request(
+                "trajectory_not_supported_for_streaming",
+                "Trajectory management (traj_id) is not supported for streaming requests",
+            );
+        }
+
+        // Try to acquire exclusive lock for this traj_id
+        if !self.processing_traj_ids.insert(traj_id.clone()) {
+            // traj_id is already being processed by another request
+            return error::bad_request(
+                "trajectory_locked",
+                format!("Trajectory with id '{}' is currently being processed by another request", traj_id),
+            );
+        }
+
+        // Create RAII guard to ensure lock is released when function returns
+        let _lock_guard = TrajLockGuard {
+            traj_id: traj_id.clone(),
+            processing_set: &self.processing_traj_ids,
+        };
+
+        let mut is_empty_node = false;
+
+        let mut chat_body = match self.traj_map.get(traj_id) {
+            Some(traj) => {
+                let cached_request = traj.value().get("cached_request").unwrap();
+                let chat_body = serde_json::from_value::<ChatCompletionRequest>(cached_request.clone()).unwrap();
+                let raw_messages = chat_body.messages;
+                let raw_instruction = match raw_messages.first().unwrap() {
+                    ChatMessage::System { content, name:_ } => Some(content.to_simple_string().clone()),
+                    _ => None,
+                };
+                let mut body_without_instructions = body.clone();
+                body_without_instructions.instructions = None;
+                let mut new_chat_body = responses_to_chat(&body_without_instructions).unwrap();
+                let incoming_messages = new_chat_body.messages;
+                let mut merged_messages = Vec::new();
+                merged_messages.extend(raw_messages);
+                merged_messages.extend(incoming_messages);
+                new_chat_body.messages = merged_messages;
+                new_chat_body.traj_id = Some(traj_id.clone());
+                if raw_instruction != body.instructions {
+                    let first_msg = new_chat_body.messages.first_mut().unwrap();
+                    if raw_instruction.is_none() {
+                        // We have new instructions
+                        if let ChatMessage::System { content:_, name:_ } = first_msg {
+                            return error::internal_error("instructions_mismatch", "Unexpected error: System message should not exist.");
+                        }
+                        new_chat_body.messages.insert(0, ChatMessage::System { content: MessageContent::Text(body.instructions.clone().unwrap()), name: None });
+                    } else if body.instructions.is_none() {
+                        // We have old instructions
+                        match first_msg {
+                            ChatMessage::System { content:_, name:_ } => {},
+                            _ => {
+                                return error::internal_error("instructions_mismatch", "Unexpected error: System message should exist.");
+                            }
+                        }
+                        new_chat_body.messages.remove(0);
+                    } else {
+                        // We have different instructions
+                        match first_msg {
+                            ChatMessage::System { content, name:_ } => {
+                                *content = MessageContent::Text(body.instructions.clone().unwrap());
+                            }
+                            _ => {
+                                return error::internal_error("instructions_mismatch", "Unexpected error: System message should exist.");
+                            }
+                        }
+                    }
+                    // Create new traj tree
+                    new_chat_body.traj_id = Some(format!("resp_{}", Uuid::new_v4()));
+                }
+                new_chat_body
+
+            }
+            None => {
+                let mut new_chat_body = responses_to_chat(body).unwrap();
+                new_chat_body.traj_id = Some(traj_id.clone());
+                new_chat_body
+            }
+        };
+        chat_body.logprobs = true;
+
+        let traj_id = chat_body.traj_id.as_ref().unwrap();
+
+        if !self.traj_map.contains_key(traj_id) {
+            // Initialize a new trajectory.
+            self.traj_map.insert(traj_id.clone(), json!({"cached_token_ids": null, "output_token_mask": null, "cached_request": null, "cached_tools_text": null, "eos_token_id": null, "cached_token_logprobs": null}));
+            self.traj_chain.insert(traj_id.clone(), vec![]);
+            // Root node will not be accessed again, we will delete it later
+            is_empty_node = true;
+        }
+        // Clone the trajectory value and immediately drop the lock
+        let trajectory_value = self.traj_map.get(traj_id)
+            .expect("Unexpected error: traj not found")
+            .value()
+            .clone();
+        // Now the lock is released
+
+        if is_empty_node {
+            self.traj_chain.remove(traj_id).expect("Unexpected error: traj chain not found");
+            self.traj_map.remove(traj_id).expect("Unexpected error: traj not found");
+        }
+
+        chat_body.trajectory = Some(trajectory_value);
+        drop(_lock_guard);
+
+        let result = self.route_typed_request(headers, &chat_body, "/v1/chat/completions", model_id).await;
+
+        // Extract and process response body
+        if result.status().is_success() {
+            let status = result.status();
+            let headers_clone = result.headers().clone();
+
+            // Extract response body (limit to 100MB for safety)
+            const MAX_BODY_SIZE: usize = 100 * 1024 * 1024; // 100MB
+            let body_bytes = match to_bytes(result.into_body(), MAX_BODY_SIZE).await {
+                Ok(bytes) => {
+                    bytes
+                }
+                Err(e) => {
+                    error!("Failed to read response body: {}", e);
+                    return error::internal_error("read_response_body_failed", e.to_string());
+                }
+            };
+
+            // Deserialize as JSON - must succeed
+            let chat_response = match serde_json::from_slice::<ChatCompletionResponse>(&body_bytes) {
+                Ok(data) => {
+                    data
+                }
+                Err(e) => {
+                    error!("Failed to parse response as JSON: {}", e);
+                    return error::internal_error("parse_response_json_failed", format!("Failed to parse response as JSON: {}", e));
+                }
+            };
+
+            // Extract metadata - must exist
+            let metadata = match chat_response.metadata.as_ref() {
+                Some(meta) => {
+                    meta
+                }
+                None => {
+                    error!("Response missing metadata field");
+                    return error::internal_error("missing_metadata", "Response missing metadata field");
+                }
+            };
+
+            // Extract trajectory - must exist
+            let trajectory = match metadata.get("trajectory") {
+                Some(traj) => {
+                    traj
+                }
+                None => {
+                    error!("Response metadata missing trajectory field");
+                    return error::internal_error("missing_trajectory", "Response metadata missing trajectory field");
+                }
+            };
+            let new_response_id = format!("resp_{}", Uuid::new_v4());
+            // Update traj_map with the new trajectory
+            self.traj_map.insert(new_response_id.clone(), trajectory.clone());
+            // Always initialize traj_chain for the new response_id
+            self.traj_chain.insert(new_response_id.clone(), vec![]);
+
+            if let Some(id) = &body.previous_response_id {
+                self.traj_chain.get_mut(id).expect("Unexpected error: traj chain not found").push(new_response_id.clone());
+            }
+
+            let responses_response = chat_to_responses(&chat_response, body, Some(new_response_id)).expect("Failed to convert chat response to responses response");
+
+            // Serialize back to bytes - must succeed
+            let modified_body = match serde_json::to_vec(&responses_response) {
+                Ok(body) => {
+                    body
+                }
+                Err(e) => {
+                    error!("Failed to serialize modified response: {}", e);
+                    return error::internal_error("serialize_response_failed", format!("Failed to serialize modified response: {}", e));
+                }
+            };
+
+            let body_len = modified_body.len();
+            let mut response = Response::new(Body::from(modified_body));
+            *response.status_mut() = status;
+            *response.headers_mut() = headers_clone;
+
+            // Update Content-Length header to match the modified body size
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response.headers_mut().insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&body_len.to_string()).unwrap(),
+            );
+
+            debug!("Returning response for traj_id={} with body_len={}", traj_id, body_len);
+            response
+        } else {
+            // For error responses, just return as-is
+            result
+        }
     }
 
     async fn get_response(
@@ -869,6 +1269,9 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             enable_igw: false,
+            traj_map: DashMap::new(),
+            traj_chain: DashMap::new(),
+            processing_traj_ids: DashSet::new(),
         }
     }
 

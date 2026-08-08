@@ -1,7 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use smg::core::{BasicWorkerBuilder, CircuitBreakerConfig, WorkerRegistry, WorkerType};
+use sgl_model_gateway::core::{
+    BasicWorkerBuilder, CircuitBreakerConfig, WorkerRegistry, WorkerType,
+};
 
 // Helper to populate registry
 fn setup_registry(count: usize) -> Arc<WorkerRegistry> {

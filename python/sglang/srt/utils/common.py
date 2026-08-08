@@ -2849,6 +2849,23 @@ def get_quantization_config(hf_config) -> str | None:
     return None
 
 
+def find_nth_token_index(
+    token_ids: List[int], token_id: int, occurrence: int
+) -> Optional[int]:
+    """Return the index of a token's 1-based occurrence, or ``None``."""
+    if occurrence < 1:
+        return None
+
+    search_start = 0
+    for _ in range(occurrence):
+        try:
+            index = token_ids.index(token_id, search_start)
+        except ValueError:
+            return None
+        search_start = index + 1
+    return index
+
+
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
         return [

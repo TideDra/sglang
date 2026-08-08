@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::{http::HeaderMap, response::Response};
+use axum::{http::HeaderMap, response::{IntoResponse, Response}};
+use dashmap::DashMap;
 use tracing::debug;
 
 use super::{context::SharedComponents, pipeline::RequestPipeline};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, WorkerRegistry, WorkerType,
-        UNKNOWN_MODEL_ID,
-    },
+    core::{is_retryable_status, ConnectionMode, RetryExecutor, WorkerRegistry, WorkerType},
     observability::metrics::{metrics_labels, Metrics},
     protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
     routers::RouterTrait,
@@ -52,6 +50,7 @@ impl GrpcPDRouter {
             tokenizer_registry: tokenizer_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
+            trajectory_map: DashMap::new(),
         });
 
         // Create PD pipeline
@@ -80,8 +79,8 @@ impl GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         debug!(
-            "Processing generate request for model: {} (PD mode)",
-            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+            "Processing generate request for model: {:?} (PD mode)",
+            model_id
         );
 
         // Clone values needed for retry closure
@@ -138,8 +137,8 @@ impl GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         debug!(
-            "Processing chat completion request for model: {} (PD mode)",
-            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+            "Processing chat completion request for model: {:?} (PD mode)",
+            model_id
         );
 
         // Clone values needed for retry closure
@@ -186,6 +185,30 @@ impl GrpcPDRouter {
             },
         )
         .await
+    }
+
+    /// Main get_trajectory implementation
+    async fn get_trajectory_impl(
+        &self,
+        _headers: Option<&HeaderMap>,
+        traj_id: &str,
+    ) -> Response {
+        match self.shared_components.trajectory_map.get(traj_id) {
+            Some(traj) => axum::Json(traj.value()).into_response(),
+            None => crate::routers::error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id)),
+        }
+    }
+
+    /// Main delete_trajectory implementation
+    async fn delete_trajectory_impl(
+        &self,
+        _headers: Option<&HeaderMap>,
+        traj_id: &str,
+    ) -> Response {
+        match self.shared_components.trajectory_map.remove(traj_id) {
+            Some(_) => axum::Json(serde_json::json!({ "message": "Trajectory deleted" })).into_response(),
+            None => crate::routers::error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id)),
+        }
     }
 }
 
@@ -236,6 +259,14 @@ impl RouterTrait for GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await
+    }
+
+    async fn get_trajectory(&self, _headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        self.get_trajectory_impl(_headers, traj_id).await
+    }
+
+    async fn delete_trajectory(&self, _headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        self.delete_trajectory_impl(_headers, traj_id).await
     }
 
     fn router_type(&self) -> &'static str {
