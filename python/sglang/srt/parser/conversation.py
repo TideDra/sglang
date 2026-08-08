@@ -67,6 +67,7 @@ class SeparatorStyle(IntEnum):
     GEMMA3 = auto()
     MPT = auto()
     PADDLE_OCR = auto()
+    PHI3 = auto()
 
 
 @dataclasses.dataclass
@@ -165,6 +166,15 @@ class Conversation:
                     ret += role + message + seps[i % 2]
                 else:
                     ret += role
+            return ret
+        elif self.sep_style == SeparatorStyle.PHI3:
+            ret = ""
+            if self.system_message:
+                ret += f"<|system|>\n{self.system_message}{self.sep}"
+            for role, message in self.messages:
+                ret += role + "\n"
+                if message:
+                    ret += message + self.sep
             return ret
         elif self.sep_style == SeparatorStyle.RWKV:
             ret = system_prompt
@@ -749,7 +759,21 @@ register_conv_template(
     )
 )
 
-# TODO (lifuhuang): Refactor BaseMultimodalProcessor to support the default image token "<|image_{index}|>" in the future.
+# The Phi3V processor renumbers repeated placeholders to <|image_1|>,
+# <|image_2|>, ... before invoking the Hugging Face processor.
+register_conv_template(
+    Conversation(
+        name="phi-3-vision",
+        system_message="",
+        system_template="",
+        roles=("<|user|>", "<|assistant|>"),
+        sep_style=SeparatorStyle.PHI3,
+        sep="<|end|>\n",
+        stop_str="<|end|>",
+        image_token="<|image_1|>",
+    )
+)
+
 register_conv_template(
     Conversation(
         name="phi-4-mm",
@@ -1031,6 +1055,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "internvl_chat": "internvl-2-5",
     "deepseek_vl_v2": "deepseek-vl2",
     "multi_modality": "janus-pro",
+    "phi3_v": "phi-3-vision",
     "phi4mm": "phi-4-mm",
     "minicpmv": "minicpmv",
     "minicpmo": "minicpmo",
@@ -1103,6 +1128,14 @@ def match_minicpm(model_path: str):
     match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
     if match:
         return f"minicpm{match.group(1).lower()}"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+@register_conv_template_matching_function
+def match_phi_3_vision(model_path: str):
+    if re.search(r"phi-3(?:\.5)?-vision", model_path, re.IGNORECASE):
+        return "phi-3-vision"
     model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
