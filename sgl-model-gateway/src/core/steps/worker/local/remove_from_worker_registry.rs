@@ -1,13 +1,14 @@
 //! Step to remove workers from worker registry.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    core::steps::workflow_data::WorkerRemovalWorkflowData, observability::metrics::Metrics,
+    app_context::AppContext,
+    observability::metrics::Metrics,
+    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
 /// Step to remove workers from the worker registry.
@@ -16,17 +17,10 @@ use crate::{
 pub struct RemoveFromWorkerRegistryStep;
 
 #[async_trait]
-impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let worker_urls = &context.data.worker_urls;
+impl StepExecutor for RemoveFromWorkerRegistryStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let worker_urls: Arc<Vec<String>> = context.get_or_err("worker_urls")?;
 
         debug!(
             "Removing {} worker(s) from worker registry",

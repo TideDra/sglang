@@ -7,14 +7,11 @@ use axum::response::Response;
 use tracing::error;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
-use crate::{
-    core::AttachedBody,
-    routers::{
-        error,
-        grpc::{
-            common::stages::PipelineStage,
-            context::{FinalResponse, RequestContext, RequestType},
-        },
+use crate::routers::{
+    error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{FinalResponse, RequestContext, RequestType},
     },
 };
 
@@ -22,7 +19,7 @@ use crate::{
 ///
 /// Takes output tokens from execution and parses them using HarmonyParserAdapter
 /// to extract analysis, tool calls, and final response text from Harmony channels.
-pub(crate) struct HarmonyResponseProcessingStage {
+pub struct HarmonyResponseProcessingStage {
     processor: HarmonyResponseProcessor,
     streaming_processor: Arc<HarmonyStreamingProcessor>,
 }
@@ -84,7 +81,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
 
                     // Attach load guards to response body for proper RAII lifecycle
                     let response = match ctx.state.load_guards.take() {
-                        Some(guards) => AttachedBody::wrap_response(response, guards),
+                        Some(guards) => guards.attach_to_response(response),
                         None => response,
                     };
 

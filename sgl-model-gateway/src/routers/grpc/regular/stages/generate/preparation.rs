@@ -23,7 +23,7 @@ use crate::{
 ///
 /// Extracts generate-specific preparation logic from the old unified PreparationStage.
 /// This is a direct extraction without architectural changes.
-pub(crate) struct GeneratePreparationStage;
+pub struct GeneratePreparationStage;
 
 #[async_trait]
 impl PipelineStage for GeneratePreparationStage {

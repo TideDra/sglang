@@ -1,11 +1,9 @@
 //! Shared response functionality used by both regular and harmony implementations
 
-pub(crate) mod context;
-pub(crate) mod handlers;
-pub(crate) mod streaming;
-pub(crate) mod utils;
+pub mod handlers;
+pub mod streaming;
+pub mod utils;
 
-// Re-export commonly used items
-pub(crate) use context::ResponsesContext;
-pub(crate) use streaming::build_sse_response;
-pub(crate) use utils::{ensure_mcp_connection, persist_response_if_needed};
+pub use handlers::{cancel_response_impl, get_response_impl};
+pub use streaming::{build_sse_response, OutputItemType, ResponseStreamEventEmitter};
+pub use utils::{ensure_mcp_connection, persist_response_if_needed};

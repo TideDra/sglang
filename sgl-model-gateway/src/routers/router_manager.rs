@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use crate::{
     app_context::AppContext,
     config::RoutingMode,
-    core::{ConnectionMode, RuntimeType, WorkerRegistry, WorkerType},
+    core::{ConnectionMode, WorkerRegistry, WorkerType},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -281,7 +281,7 @@ impl RouterManager {
         let workers = self.worker_registry.get_by_model(model_id);
 
         // Find the best router ID based on worker capabilities
-        // Priority: external (OpenAI) > grpc-pd > http-pd > grpc-regular > http-regular
+        // Priority: grpc-pd > http-pd > grpc-regular > http-regular
         let best_router_id = workers
             .iter()
             .map(|w| {
@@ -290,12 +290,6 @@ impl RouterManager {
                     WorkerType::Prefill { .. } | WorkerType::Decode
                 );
                 let is_grpc = matches!(w.connection_mode(), ConnectionMode::Grpc { .. });
-                let is_external = matches!(w.metadata().runtime_type, RuntimeType::External);
-
-                if is_external {
-                    // External workers should be routed via OpenAI-compatible router
-                    return (4, &router_ids::HTTP_OPENAI);
-                }
 
                 match (is_grpc, is_pd) {
                     (true, true) => (3, &router_ids::GRPC_PD),
@@ -724,6 +718,32 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 "No router available for rerank request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn get_trajectory(&self, headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.get_trajectory(headers, traj_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("No router available to get trajectory '{}'", traj_id),
+            )
+                .into_response()
+        }
+    }
+
+    async fn delete_trajectory(&self, headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.delete_trajectory(headers, traj_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("No router available to delete trajectory '{}'", traj_id),
             )
                 .into_response()
         }

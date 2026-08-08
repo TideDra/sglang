@@ -113,7 +113,7 @@ fn has_custom_tools(tool_types: &[&str]) -> bool {
 ///
 /// Converts OpenAI-format requests into Harmony-encoded format with input_ids,
 /// stop tokens, and selection text for worker routing.
-pub(crate) struct HarmonyBuilder {
+pub struct HarmonyBuilder {
     encoding: &'static HarmonyEncoding,
 }
 
@@ -496,6 +496,7 @@ impl HarmonyBuilder {
                     .filter_map(|part| match part {
                         ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
                         ResponseContentPart::InputText { text } => Some(text.clone()),
+                        ResponseContentPart::InputImage { .. } => None,
                         ResponseContentPart::Unknown => None,
                     })
                     .collect();
@@ -648,6 +649,7 @@ impl HarmonyBuilder {
                             .filter_map(|part| match part {
                                 ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
                                 ResponseContentPart::InputText { text } => Some(text.clone()),
+                                ResponseContentPart::InputImage { .. } => None,
                                 ResponseContentPart::Unknown => None,
                             })
                             .collect::<Vec<_>>()

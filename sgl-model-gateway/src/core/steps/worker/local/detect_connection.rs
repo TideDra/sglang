@@ -1,16 +1,18 @@
 //! Connection mode detection step.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use reqwest::Client;
 use tracing::debug;
-use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::strip_protocol;
 use crate::{
-    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
+    app_context::AppContext,
+    core::ConnectionMode,
+    protocols::worker_spec::WorkerConfigRequest,
     routers::grpc::client::GrpcClient,
+    workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
 /// Try HTTP health check.
@@ -86,17 +88,10 @@ async fn try_grpc_health_check(
 pub struct DetectConnectionModeStep;
 
 #[async_trait]
-impl StepExecutor<LocalWorkerWorkflowData> for DetectConnectionModeStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let config = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+impl StepExecutor for DetectConnectionModeStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!(
             "Detecting connection mode for {} (timeout: {}s, max_attempts: {})",
@@ -134,7 +129,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for DetectConnectionModeStep {
             }
         };
 
-        context.data.connection_mode = Some(connection_mode);
+        context.set("connection_mode", connection_mode);
         Ok(StepResult::Success)
     }
 

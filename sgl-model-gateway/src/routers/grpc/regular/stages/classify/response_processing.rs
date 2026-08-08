@@ -10,7 +10,10 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use axum::response::Response;
+use axum::{
+    response::{IntoResponse, Response},
+    Json,
+};
 use tracing::error;
 
 use crate::{
@@ -34,7 +37,7 @@ use crate::{
 ///
 /// The stage is stateless - id2label mapping is obtained from the
 /// selected worker's model card at runtime.
-pub(crate) struct ClassifyResponseProcessingStage;
+pub struct ClassifyResponseProcessingStage;
 
 impl ClassifyResponseProcessingStage {
     /// Create a new classify response processing stage.
@@ -202,10 +205,11 @@ impl PipelineStage for ClassifyResponseProcessingStage {
             usage,
         );
 
-        // Store in context for pipeline to extract
-        ctx.state.response.final_response = Some(FinalResponse::Classify(response));
+        // Store in context
+        ctx.state.response.final_response = Some(FinalResponse::Classify(response.clone()));
 
-        Ok(None)
+        // Return HTTP response
+        Ok(Some(Json(response).into_response()))
     }
 
     fn name(&self) -> &'static str {

@@ -10,13 +10,11 @@ use crate::protocols::common::ToolCall;
 ///
 /// Represents messages in the Harmony encoding format with role and content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct HarmonyMessage {
+pub struct HarmonyMessage {
     pub role: String,
     pub content: String,
 }
 
-/// Some methods are kept for API completeness even if currently unused.
-#[allow(dead_code)]
 impl HarmonyMessage {
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -69,7 +67,7 @@ impl HarmonyMessage {
 /// Contains the encoded input_ids, stop tokens, selection text for worker routing,
 /// and the Harmony message history.
 #[derive(Debug, Clone)]
-pub(crate) struct HarmonyBuildOutput {
+pub struct HarmonyBuildOutput {
     /// Encoded token IDs to send to the model
     pub input_ids: Vec<u32>,
 
@@ -87,7 +85,7 @@ pub(crate) struct HarmonyBuildOutput {
 ///
 /// Represents the complete response after parsing analysis, commentary, and final channels.
 #[derive(Debug, Clone)]
-pub(crate) struct HarmonyChannelOutput {
+pub struct HarmonyChannelOutput {
     /// Analysis/reasoning content (from analysis channel)
     pub analysis: Option<String>,
 
@@ -111,7 +109,7 @@ pub(crate) struct HarmonyChannelOutput {
 ///
 /// Represents incremental updates as tokens are parsed from the stream.
 #[derive(Debug, Clone)]
-pub(crate) struct HarmonyChannelDelta {
+pub struct HarmonyChannelDelta {
     /// Delta for analysis/reasoning content
     pub analysis_delta: Option<String>,
 
@@ -122,13 +120,12 @@ pub(crate) struct HarmonyChannelDelta {
     pub final_delta: Option<String>,
 
     /// Whether this is the final delta
-    #[allow(dead_code)]
     pub is_final: bool,
 }
 
 /// Tool call delta for streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ToolCallDelta {
+pub struct ToolCallDelta {
     pub index: usize,
     pub id: Option<String>,
     pub function: Option<FunctionDelta>,
@@ -136,7 +133,7 @@ pub(crate) struct ToolCallDelta {
 
 /// Function call delta for streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct FunctionDelta {
+pub struct FunctionDelta {
     pub name: Option<String>,
     pub arguments: Option<String>,
 }

@@ -12,7 +12,7 @@
 {%- endfor %}
 {%- endif %}
 {%- if message['role'] == 'assistant' %}
-{{- '<|end|>' + eos_token + '\n' -}}
+{{- '<|end|><|endoftext|>\n' -}}
 {%- else %}
 {{- '<|end|>\n' -}}
 {%- endif %}

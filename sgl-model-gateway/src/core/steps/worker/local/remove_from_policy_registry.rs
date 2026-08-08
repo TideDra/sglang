@@ -1,10 +1,15 @@
 //! Step to remove workers from policy registry.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use tracing::debug;
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::core::steps::workflow_data::WorkerRemovalWorkflowData;
+use crate::{
+    app_context::AppContext,
+    core::Worker,
+    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+};
 
 /// Step to remove workers from the policy registry.
 ///
@@ -13,21 +18,11 @@ use crate::core::steps::workflow_data::WorkerRemovalWorkflowData;
 pub struct RemoveFromPolicyRegistryStep;
 
 #[async_trait]
-impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let workers_to_remove = context
-            .data
-            .actual_workers_to_remove
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers_to_remove".to_string()))?;
+impl StepExecutor for RemoveFromPolicyRegistryStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let workers_to_remove: Arc<Vec<Arc<dyn Worker>>> =
+            context.get_or_err("workers_to_remove")?;
 
         debug!(
             "Removing {} worker(s) from policy registry",

@@ -11,8 +11,8 @@ use crate::{
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
         common::{
-            FunctionCallResponse, JsonSchemaFormat, ResponseFormat, StreamOptions, ToolCall,
-            UsageInfo,
+            ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat,
+            StreamOptions, ToolCall, UsageInfo,
         },
         responses::{
             ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
@@ -33,7 +33,7 @@ use crate::{
 /// - `tools` → function tools extracted from ResponseTools
 /// - `tool_choice` → passed through from request
 /// - Response-specific fields (previous_response_id, conversation) are handled by router
-pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
+pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
     let mut messages = Vec::new();
 
     // 1. Add system message if instructions provided
@@ -58,31 +58,18 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
             for item in items {
                 match item {
                     ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
-                        // Convert SimpleInputMessage to chat message
-                        let text = match content {
-                            StringOrContentParts::String(s) => s.clone(),
+                        let message_content = match content {
+                            StringOrContentParts::String(s) => MessageContent::Text(s.clone()),
                             StringOrContentParts::Array(parts) => {
-                                // Extract text from content parts (only InputText supported)
-                                parts
-                                    .iter()
-                                    .filter_map(|part| match part {
-                                        ResponseContentPart::InputText { text } => {
-                                            Some(text.as_str())
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
+                                response_parts_to_message_content(parts, " ")
                             }
                         };
 
-                        messages.push(role_to_chat_message(role.as_str(), text));
+                        messages.push(role_to_chat_message(role.as_str(), message_content));
                     }
                     ResponseInputOutputItem::Message { role, content, .. } => {
-                        // Extract text from content parts
-                        let text = extract_text_from_content(content);
-
-                        messages.push(role_to_chat_message(role.as_str(), text));
+                        let message_content = response_parts_to_message_content(content, "");
+                        messages.push(role_to_chat_message(role.as_str(), message_content));
                     }
                     ResponseInputOutputItem::FunctionToolCall {
                         id,
@@ -197,40 +184,70 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
     })
 }
 
-/// Extract text content from ResponseContentPart array
-fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
-    content
+/// Convert Responses API content parts to chat content while preserving multimodal order.
+/// Text-only inputs keep the legacy flattened representation.
+fn response_parts_to_message_content(
+    content: &[ResponseContentPart],
+    text_separator: &str,
+) -> MessageContent {
+    let has_image = content
+        .iter()
+        .any(|part| matches!(part, ResponseContentPart::InputImage { .. }));
+
+    if !has_image {
+        let text = content
+            .iter()
+            .filter_map(|part| match part {
+                ResponseContentPart::InputText { text } => Some(text.as_str()),
+                ResponseContentPart::OutputText { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(text_separator);
+        return MessageContent::Text(text);
+    }
+
+    let parts = content
         .iter()
         .filter_map(|part| match part {
-            ResponseContentPart::InputText { text } => Some(text.as_str()),
-            ResponseContentPart::OutputText { text, .. } => Some(text.as_str()),
-            _ => None,
+            ResponseContentPart::InputText { text }
+            | ResponseContentPart::OutputText { text, .. } => {
+                Some(ContentPart::Text { text: text.clone() })
+            }
+            ResponseContentPart::InputImage { image_url, detail } => Some(ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: image_url.clone(),
+                    detail: detail.clone(),
+                },
+            }),
+            ResponseContentPart::Unknown => None,
         })
-        .collect::<Vec<_>>()
-        .join("")
+        .collect();
+
+    MessageContent::Parts(parts)
 }
 
-/// Convert role and text to ChatMessage
-fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
+/// Convert role and content to ChatMessage
+fn role_to_chat_message(role: &str, content: MessageContent) -> ChatMessage {
     match role {
         "user" => ChatMessage::User {
-            content: MessageContent::Text(text),
+            content,
             name: None,
         },
         "assistant" => ChatMessage::Assistant {
-            content: Some(MessageContent::Text(text)),
+            content: Some(content),
             name: None,
             tool_calls: None,
             reasoning_content: None,
         },
         "system" => ChatMessage::System {
-            content: MessageContent::Text(text),
+            content,
             name: None,
         },
         _ => {
             // Unknown role, treat as user message
             ChatMessage::User {
-                content: MessageContent::Text(text),
+                content,
                 name: None,
             }
         }
@@ -271,7 +288,7 @@ fn map_text_to_response_format(text: &Option<TextConfig>) -> Option<ResponseForm
 /// - `choices[0].message` → `output` array (convert to ResponseOutputItem::Message)
 /// - `choices[0].finish_reason` → determines `status` (stop/length → Completed)
 /// - `created` timestamp → `created_at`
-pub(crate) fn chat_to_responses(
+pub fn chat_to_responses(
     chat_resp: &ChatCompletionResponse,
     original_req: &ResponsesRequest,
     response_id_override: Option<String>,
@@ -349,7 +366,7 @@ pub(crate) fn chat_to_responses(
                 .and_then(|d| d.reasoning_tokens),
             prompt_tokens_details: None, // Chat response doesn't have this
         };
-        ResponsesUsage::Classic(usage_info)
+        ResponsesUsage::Modern(usage_info.to_response_usage())
     });
 
     // Generate response
@@ -366,6 +383,8 @@ pub(crate) fn chat_to_responses(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -424,5 +443,53 @@ mod tests {
         // Empty text should still create a user message, so this should succeed
         let result = responses_to_chat(&req);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_multimodal_input_conversion() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "microsoft/Phi-3.5-vision-instruct",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AAAA",
+                        "detail": "auto"
+                    },
+                    {
+                        "type": "input_text",
+                        "text": "What color is this image?"
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let chat_req = responses_to_chat(&req).unwrap();
+        assert_eq!(chat_req.messages.len(), 1);
+
+        let ChatMessage::User {
+            content: MessageContent::Parts(parts),
+            ..
+        } = &chat_req.messages[0]
+        else {
+            panic!("expected a multimodal user message");
+        };
+
+        assert_eq!(
+            parts,
+            &vec![
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,AAAA".to_string(),
+                        detail: Some("auto".to_string()),
+                    },
+                },
+                ContentPart::Text {
+                    text: "What color is this image?".to_string(),
+                },
+            ]
+        );
     }
 }
