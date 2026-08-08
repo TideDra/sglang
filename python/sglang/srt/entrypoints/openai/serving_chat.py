@@ -52,6 +52,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils import find_nth_token_index
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -303,6 +304,11 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        trajectory = (
+            self.traj_map.get(request.traj_id)
+            if is_multimodal and request.traj_id
+            else None
+        )
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -332,6 +338,18 @@ class OpenAIServingChat(OpenAIServingBase):
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+            return_input_ids=(
+                bool(request.traj_id)
+                and self.tokenizer_manager.model_config.is_multimodal
+            ),
+            trajectory_input_ids=(
+                list(trajectory.cached_token_ids)
+                if trajectory and trajectory.cached_token_ids
+                else None
+            ),
+            trajectory_eos_token_id=(
+                trajectory.eos_token_id if trajectory is not None else None
+            ),
         )
 
         return adapted_request, request
@@ -376,10 +394,6 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
             if request.traj_id:
-                if is_multimodal:
-                    raise ValueError(
-                        "Multimodal is not supported when using trajectory tracking"
-                    )
                 if not isinstance(result.prompt_ids, list):
                     raise ValueError(
                         "When using trajectory tracking, the prompt_ids must be a list"
@@ -390,7 +404,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 if request.traj_id not in self.traj_map and not request.trajectory:
                     # Neither cached traj nor given traj. Internally initialize a new traj.
-                    cached_token_ids = result.prompt_ids
+                    # For multimodal requests these are only the placeholder IDs
+                    # produced by the chat template. The model-ready IDs are captured
+                    # after multimodal preprocessing and cached with the response.
+                    cached_token_ids = [] if is_multimodal else result.prompt_ids
                     output_token_mask = [0] * len(cached_token_ids)
                     cached_token_logprobs = [0] * len(cached_token_ids)
                     cached_request = request
@@ -401,7 +418,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         cached_token_logprobs=cached_token_logprobs,
                         cached_request=cached_request,
                         cached_tools_text=cached_tools_text,
-                        eos_token_id=self.tokenizer_manager.tokenizer.eos_token_id,
+                        eos_token_id=self._select_trajectory_eos_token_id(
+                            result.prompt_ids
+                        ),
                     )
                 elif request.traj_id in self.traj_map and request.trajectory:
                     raise ValueError(
@@ -421,92 +440,108 @@ class OpenAIServingChat(OpenAIServingBase):
                             raise ValueError(
                                 "The tools are not the same as the cached tools"
                             )
-                        cached_result = self._apply_jinja_template(
-                            traj.cached_request,
-                            tools,
-                            is_multimodal,
-                            add_generation_prompt=False,
-                            skip_last_assistant_handling=True,
-                        )
-                        cached_prompt_ids_len = len(cached_result.prompt_ids)
-                        if (
-                            result.prompt_ids[:cached_prompt_ids_len]
-                            != cached_result.prompt_ids
-                        ):
-                            # Debug: find first divergence point
-                            _tokenizer = self.tokenizer_manager.tokenizer
-                            _min_len = min(
-                                cached_prompt_ids_len, len(result.prompt_ids)
-                            )
-                            _diverge = next(
-                                (
-                                    i
-                                    for i in range(_min_len)
-                                    if result.prompt_ids[i]
-                                    != cached_result.prompt_ids[i]
-                                ),
-                                _min_len,
-                            )
-                            _ctx = 20
-                            logger.error(
-                                "Trajectory prefix mismatch at token %d "
-                                "(cached_len=%d, new_len=%d)\n"
-                                "  cached[%d:%d] = %r\n"
-                                "  new   [%d:%d] = %r\n"
-                                "  cached_request last msg = %s",
-                                _diverge,
-                                cached_prompt_ids_len,
-                                len(result.prompt_ids),
-                                max(0, _diverge - _ctx),
-                                _diverge + _ctx,
-                                _tokenizer.decode(
-                                    cached_result.prompt_ids[
-                                        max(0, _diverge - _ctx) : _diverge + _ctx
-                                    ]
-                                ),
-                                max(0, _diverge - _ctx),
-                                _diverge + _ctx,
-                                _tokenizer.decode(
-                                    result.prompt_ids[
-                                        max(0, _diverge - _ctx) : _diverge + _ctx
-                                    ]
-                                ),
-                                traj.cached_request.messages[-1].model_dump()
-                                if traj.cached_request.messages
-                                else "N/A",
-                            )
-                            raise ValueError(
-                                "The new prompt does not start with the cached prompt"
-                            )
-                        last_eos_index = cached_prompt_ids_len - 1
-                        for t in reversed(cached_result.prompt_ids):
-                            if t == traj.eos_token_id:
-                                break
-                            last_eos_index -= 1
-                        if last_eos_index < 0:
-                            cached_token_len = cached_prompt_ids_len
+                        if is_multimodal:
+                            cached_messages = traj.cached_request.messages
+                            if (
+                                len(request.messages) < len(cached_messages)
+                                or request.messages[: len(cached_messages)]
+                                != cached_messages
+                            ):
+                                raise ValueError(
+                                    "The new prompt does not start with the cached prompt"
+                                )
                         else:
-                            cached_token_len = last_eos_index + 1
-                        if len(result.prompt_ids) == cached_prompt_ids_len:
-                            # If the prompt is the same, cached token should keep unchanged.
-                            cached_token_len = len(result.prompt_ids)
-                        delta_token_ids = result.prompt_ids[cached_token_len:]
-                        delta_output_token_mask = [0] * len(delta_token_ids)
-                        delta_token_logprobs = [0] * len(delta_token_ids)
-                        traj.cached_token_ids.extend(delta_token_ids)
-                        traj.output_token_mask.extend(delta_output_token_mask)
-                        traj.cached_token_logprobs.extend(delta_token_logprobs)
+                            cached_result = self._apply_jinja_template(
+                                traj.cached_request,
+                                tools,
+                                is_multimodal,
+                                add_generation_prompt=False,
+                                skip_last_assistant_handling=True,
+                            )
+                            cached_prompt_ids_len = len(cached_result.prompt_ids)
+                            if (
+                                result.prompt_ids[:cached_prompt_ids_len]
+                                != cached_result.prompt_ids
+                            ):
+                                # Debug: find first divergence point
+                                _tokenizer = self.tokenizer_manager.tokenizer
+                                _min_len = min(
+                                    cached_prompt_ids_len, len(result.prompt_ids)
+                                )
+                                _diverge = next(
+                                    (
+                                        i
+                                        for i in range(_min_len)
+                                        if result.prompt_ids[i]
+                                        != cached_result.prompt_ids[i]
+                                    ),
+                                    _min_len,
+                                )
+                                _ctx = 20
+                                logger.error(
+                                    "Trajectory prefix mismatch at token %d "
+                                    "(cached_len=%d, new_len=%d)\n"
+                                    "  cached[%d:%d] = %r\n"
+                                    "  new   [%d:%d] = %r\n"
+                                    "  cached_request last msg = %s",
+                                    _diverge,
+                                    cached_prompt_ids_len,
+                                    len(result.prompt_ids),
+                                    max(0, _diverge - _ctx),
+                                    _diverge + _ctx,
+                                    _tokenizer.decode(
+                                        cached_result.prompt_ids[
+                                            max(0, _diverge - _ctx) : _diverge + _ctx
+                                        ]
+                                    ),
+                                    max(0, _diverge - _ctx),
+                                    _diverge + _ctx,
+                                    _tokenizer.decode(
+                                        result.prompt_ids[
+                                            max(0, _diverge - _ctx) : _diverge + _ctx
+                                        ]
+                                    ),
+                                    (
+                                        traj.cached_request.messages[-1].model_dump()
+                                        if traj.cached_request.messages
+                                        else "N/A"
+                                    ),
+                                )
+                                raise ValueError(
+                                    "The new prompt does not start with the cached prompt"
+                                )
+                            last_eos_index = cached_prompt_ids_len - 1
+                            for t in reversed(cached_result.prompt_ids):
+                                if t == traj.eos_token_id:
+                                    break
+                                last_eos_index -= 1
+                            if last_eos_index < 0:
+                                cached_token_len = cached_prompt_ids_len
+                            else:
+                                cached_token_len = last_eos_index + 1
+                            if len(result.prompt_ids) == cached_prompt_ids_len:
+                                # If the prompt is the same, cached token should keep unchanged.
+                                cached_token_len = len(result.prompt_ids)
                         traj.cached_request = request
-                        result.prompt_ids = traj.cached_token_ids
+                        if not is_multimodal:
+                            delta_token_ids = result.prompt_ids[cached_token_len:]
+                            delta_output_token_mask = [0] * len(delta_token_ids)
+                            delta_token_logprobs = [0] * len(delta_token_ids)
+                            traj.cached_token_ids.extend(delta_token_ids)
+                            traj.output_token_mask.extend(delta_output_token_mask)
+                            traj.cached_token_logprobs.extend(delta_token_logprobs)
+                            result.prompt_ids = traj.cached_token_ids
                     else:
                         # Given traj is empty.
-                        traj.cached_token_ids = result.prompt_ids
-                        traj.output_token_mask = [0] * len(result.prompt_ids)
-                        traj.cached_token_logprobs = [0] * len(result.prompt_ids)
+                        traj.cached_token_ids = (
+                            [] if is_multimodal else result.prompt_ids
+                        )
+                        traj.output_token_mask = [0] * len(traj.cached_token_ids)
+                        traj.cached_token_logprobs = [0] * len(traj.cached_token_ids)
                         traj.cached_request = request
                         traj.cached_tools_text = str(tools)
-                        traj.eos_token_id = (
-                            self.tokenizer_manager.tokenizer.eos_token_id
+                        traj.eos_token_id = self._select_trajectory_eos_token_id(
+                            result.prompt_ids
                         )
 
         else:
@@ -1160,6 +1195,14 @@ class OpenAIServingChat(OpenAIServingBase):
                         status_code=410,
                     )
                 traj = self.traj_map[request.traj_id]
+                if self.tokenizer_manager.model_config.is_multimodal:
+                    input_ids = ret_item["meta_info"].pop("input_ids", None)
+                    if input_ids is None:
+                        raise ValueError(
+                            "Multimodal trajectory tracking did not receive the "
+                            "post-processor input IDs"
+                        )
+                    self._append_multimodal_prompt_tokens(traj, input_ids)
                 output_tokens = ret_item["output_ids"]
                 traj.cached_token_ids.extend(output_tokens)
                 traj.output_token_mask.extend([1] * len(output_tokens))
@@ -1194,6 +1237,18 @@ class OpenAIServingChat(OpenAIServingBase):
                     traj.cached_token_logprobs.extend(logprob_values)
                 else:
                     traj.cached_token_logprobs.extend([0] * len(output_tokens))
+                matched_stop = choice_data.matched_stop
+                if (
+                    isinstance(matched_stop, int)
+                    and not isinstance(matched_stop, bool)
+                    and output_tokens
+                    and output_tokens[-1] == matched_stop
+                ):
+                    # Some chat models terminate turns with an additional EOS
+                    # token instead of tokenizer.eos_token_id. Keep the actual
+                    # decoded boundary so continuations can find the rendered
+                    # assistant turn without re-tokenizing its raw output.
+                    traj.eos_token_id = matched_stop
                 if traj.cached_token_ids[-1] != traj.eos_token_id:
                     if choice_data.finish_reason != "length":
                         raise ValueError(
@@ -1246,6 +1301,47 @@ class OpenAIServingChat(OpenAIServingBase):
             metadata=metadata,
             sglext=response_sglext,
         )
+
+    def _select_trajectory_eos_token_id(self, prompt_ids: List[int]) -> int:
+        """Select the EOS token that the chat template uses between turns."""
+        tokenizer_eos_token_id = self.tokenizer_manager.tokenizer.eos_token_id
+        model_eos_token_ids = self.tokenizer_manager.model_config.hf_eos_token_id
+        if not isinstance(model_eos_token_ids, (set, list, tuple)):
+            model_eos_token_ids = {tokenizer_eos_token_id}
+
+        model_eos_token_ids = set(model_eos_token_ids)
+        for token_id in reversed(prompt_ids):
+            if token_id in model_eos_token_ids:
+                return token_id
+        return tokenizer_eos_token_id
+
+    @staticmethod
+    def _append_multimodal_prompt_tokens(
+        traj: Trajectory, input_ids: List[int]
+    ) -> None:
+        """Append only the newly processed prompt tokens to a trajectory.
+
+        A multimodal processor tokenizes the entire rendered conversation and
+        expands image placeholders. On a continuation, the turn-boundary token
+        occurrence count in the raw cache identifies where the previously cached
+        assistant turn ends in the newly processed prompt. Keeping only the suffix
+        after it avoids replacing original generated IDs with re-tokenized IDs.
+        """
+        if traj.cached_token_ids:
+            cached_eos_count = traj.cached_token_ids.count(traj.eos_token_id)
+            cached_end_index = find_nth_token_index(
+                input_ids, traj.eos_token_id, cached_eos_count
+            )
+            if cached_end_index is None:
+                raise ValueError(
+                    "The multimodal continuation prompt does not contain all "
+                    "cached trajectory turn-boundary tokens"
+                )
+            input_ids = input_ids[cached_end_index + 1 :]
+
+        traj.cached_token_ids.extend(input_ids)
+        traj.output_token_mask.extend([0] * len(input_ids))
+        traj.cached_token_logprobs.extend([0] * len(input_ids))
 
     def _process_logprobs_tokens(
         self, logprobs: LogProbs, use_token_index: bool = False

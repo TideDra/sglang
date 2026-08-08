@@ -6,21 +6,26 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
+import asyncio
 import json
 import unittest
 import uuid
 from typing import Optional
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+import torch
 from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
+    Trajectory,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.utils import get_or_create_event_loop
+from sglang.srt.managers.io_struct import BatchStrOutput, GenerateReqInput
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
+from sglang.srt.utils import find_nth_token_index, get_or_create_event_loop
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
@@ -32,6 +37,7 @@ class _MockTokenizerManager:
 
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
+        self.model_config.hf_eos_token_id = {2}
         self.server_args = Mock(
             enable_cache_report=False,
             tool_call_parser="hermes",
@@ -50,6 +56,7 @@ class _MockTokenizerManager:
         self.tokenizer.decode.return_value = "Test response"
         self.tokenizer.chat_template = None
         self.tokenizer.bos_token_id = 1
+        self.tokenizer.eos_token_id = 2
 
         # async generator stub for generate_request
         async def _mock_generate():
@@ -106,6 +113,14 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
+    def test_find_nth_token_index(self):
+        token_ids = [2, 10, 2, 20, 2]
+
+        self.assertEqual(find_nth_token_index(token_ids, 2, 1), 0)
+        self.assertEqual(find_nth_token_index(token_ids, 2, 3), 4)
+        self.assertIsNone(find_nth_token_index(token_ids, 2, 4))
+        self.assertIsNone(find_nth_token_index(token_ids, 2, 0))
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with patch(
@@ -132,6 +147,499 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
+
+    def test_multimodal_trajectory_requests_postprocessor_input_ids(self):
+        self.tm.model_config.is_multimodal = True
+        processed_messages = MessageProcessingResult(
+            prompt="<image>Test prompt",
+            prompt_ids=[10, 11, 12],
+            image_data=["image-data"],
+            video_data=None,
+            audio_data=None,
+            modalities=["image"],
+            stop=[],
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Describe the image"}],
+            traj_id="mm-trajectory",
+        )
+        self.chat.traj_map[request.traj_id] = Trajectory(
+            cached_token_ids=[1, 151655, 13, 20, 2],
+            output_token_mask=[0, 0, 0, 1, 1],
+            cached_token_logprobs=[0] * 5,
+            cached_request=request,
+            cached_tools_text="None",
+            eos_token_id=2,
+        )
+
+        with patch.object(
+            self.chat, "_process_messages", return_value=processed_messages
+        ):
+            adapted, _ = self.chat._convert_to_internal_request(request)
+
+        self.assertEqual(adapted.text, processed_messages.prompt)
+        self.assertIsNone(adapted.input_ids)
+        self.assertTrue(adapted.return_input_ids)
+        self.assertEqual(adapted.trajectory_input_ids, [1, 151655, 13, 20, 2])
+        self.assertEqual(adapted.trajectory_eos_token_id, 2)
+
+    def test_tokenizer_manager_restores_multimodal_trajectory_before_scheduler(self):
+        manager = object.__new__(TokenizerManager)
+        manager.mm_processor = object()
+        manager.server_args = Mock(
+            language_only=False,
+            encoder_transfer_backend=None,
+        )
+        manager.tokenizer = Mock()
+        manager.max_req_input_len = 100
+        manager._tokenize_texts = AsyncMock(return_value=([999], None))
+        manager._validate_mm_limits = Mock()
+        manager._validate_one_request = Mock()
+
+        processed_input_ids = [
+            1,
+            90,
+            90,
+            13,
+            30,
+            31,
+            32,
+            2,
+            40,
+            90,
+            90,
+            41,
+            42,
+            2,
+            50,
+            90,
+            90,
+            2,
+            60,
+        ]
+        mm_item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(1, 2), (9, 10), (15, 16)],
+        )
+        mrope_positions = torch.tensor(
+            [
+                [0, 1, 1, 3, 4, 5, 6, 7, 8, 9, 9, 11, 12, 13, 14, 15, 15, 17, 18],
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+                [0, 1, 1, 3, 4, 5, 6, 7, 8, 9, 9, 11, 12, 13, 14, 15, 15, 17, 18],
+            ]
+        )
+        mm_inputs = {
+            "input_ids": processed_input_ids,
+            "mm_items": [mm_item],
+            "mrope_positions": mrope_positions,
+            "mrope_position_delta": torch.tensor([[0]]),
+        }
+        manager.mm_data_processor = Mock(process=AsyncMock(return_value=mm_inputs))
+        manager._create_tokenized_object = Mock(
+            side_effect=lambda _obj, _text, input_ids, _embeds, inputs, _types: Mock(
+                input_ids=input_ids, mm_inputs=inputs
+            )
+        )
+
+        request = GenerateReqInput(
+            text="<image> first turn <image> second turn <image> third turn",
+            image_data=["image-1", "image-2", "image-3"],
+            sampling_params={},
+            trajectory_input_ids=[1, 90, 90, 13, 20, 2, 40, 90, 90, 21, 2],
+            trajectory_eos_token_id=2,
+            rid="request-id",
+        )
+
+        tokenized = asyncio.run(manager._tokenize_one_request(request))
+
+        self.assertEqual(
+            tokenized.input_ids,
+            [1, 90, 90, 13, 20, 2, 40, 90, 90, 21, 2, 50, 90, 90, 2, 60],
+        )
+        self.assertEqual(tokenized.mm_inputs["input_ids"], tokenized.input_ids)
+        self.assertEqual(mm_item.offsets, [(1, 2), (7, 8), (12, 13)])
+        self.assertEqual(tokenized.mm_inputs["mrope_positions"].shape, (3, 16))
+        self.assertTrue(
+            torch.equal(
+                tokenized.mm_inputs["mrope_positions"][:, 12:14],
+                torch.tensor([[12, 12], [12, 13], [12, 12]]),
+            )
+        )
+
+    def test_tokenizer_manager_returns_requested_input_ids(self):
+        manager = object.__new__(TokenizerManager)
+        request = GenerateReqInput(
+            text="prompt",
+            sampling_params={},
+            return_input_ids=True,
+            log_metrics=False,
+            rid="request-id",
+        )
+        state = ReqState(
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=request,
+            created_time=0,
+            input_ids=[1, 151655, 151655, 13],
+        )
+        manager.rid_to_state = {request.rid: state}
+        manager.server_args = Mock(
+            weight_version="test",
+            speculative_algorithm=None,
+            enable_lora=False,
+            dp_size=1,
+        )
+        manager.enable_metrics = False
+        manager.enable_trace = False
+        manager.dump_requests_folder = None
+        manager.crash_dump_folder = None
+
+        output = Mock(spec=BatchStrOutput)
+        output.rids = [request.rid]
+        output.finished_reasons = [{"type": "stop", "matched": 2}]
+        output.prompt_tokens = [4]
+        output.completion_tokens = [1]
+        output.cached_tokens = [0]
+        output.retraction_counts = [0]
+        output.output_strs = ["answer"]
+        output.output_ids = [[2]]
+        output.output_hidden_states = None
+        output.routed_experts = None
+        output.customized_info = None
+        output.cached_tokens_details = None
+        output.load = None
+
+        with patch("sglang.srt.managers.tokenizer_manager.trace_req_finish"):
+            manager._handle_batch_output(output)
+
+        self.assertEqual(state.out_list[0]["meta_info"]["input_ids"], state.input_ids)
+
+    def test_multimodal_trajectory_defers_prompt_cache_until_postprocessing(self):
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.eos_token_id = 2
+        processed_messages = MessageProcessingResult(
+            prompt="<image>Test prompt",
+            prompt_ids=[10, 11, 12],
+            image_data=["image-data"],
+            video_data=None,
+            audio_data=None,
+            modalities=["image"],
+            stop=[],
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Describe the image"}],
+            traj_id="mm-trajectory",
+        )
+
+        with patch.object(
+            self.chat, "_apply_jinja_template", return_value=processed_messages
+        ):
+            result = self.chat._process_messages(request, is_multimodal=True)
+
+        self.assertIs(result, processed_messages)
+        trajectory = self.chat.traj_map[request.traj_id]
+        self.assertEqual(trajectory.cached_token_ids, [])
+        self.assertEqual(trajectory.output_token_mask, [])
+        self.assertEqual(trajectory.cached_token_logprobs, [])
+
+    def test_trajectory_uses_chat_template_eos_token(self):
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.hf_eos_token_id = {1, 106}
+        self.tm.tokenizer.eos_token_id = 1
+        processed_messages = MessageProcessingResult(
+            prompt="<image>Test prompt",
+            prompt_ids=[2, 105, 10, 106, 105],
+            image_data=["image-data"],
+            video_data=None,
+            audio_data=None,
+            modalities=["image"],
+            stop=[],
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Describe the image"}],
+            traj_id="mm-trajectory",
+        )
+
+        with patch.object(
+            self.chat, "_apply_jinja_template", return_value=processed_messages
+        ):
+            self.chat._process_messages(request, is_multimodal=True)
+
+        self.assertEqual(self.chat.traj_map[request.traj_id].eos_token_id, 106)
+
+    def test_multimodal_trajectory_accepts_cached_message_prefix(self):
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.is_multimodal = True
+        cached_request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Describe the image"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "The image contains a cat.",
+                    "content": "A cat.",
+                },
+            ],
+            traj_id="mm-trajectory",
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                *(message.model_dump() for message in cached_request.messages),
+                {"role": "user", "content": "What color is it?"},
+            ],
+            traj_id="mm-trajectory",
+        )
+        self.chat.traj_map[request.traj_id] = Trajectory(
+            cached_token_ids=[1, 10, 2, 20, 2],
+            output_token_mask=[0, 0, 0, 1, 1],
+            cached_token_logprobs=[0] * 5,
+            cached_request=cached_request,
+            cached_tools_text="None",
+            eos_token_id=2,
+        )
+        processed_messages = MessageProcessingResult(
+            # A thinking model may strip historical reasoning here, so these
+            # re-tokenized IDs need not start with the prior rendered prompt.
+            prompt="rendered prompt without historical reasoning",
+            prompt_ids=[1, 10, 2, 30, 2, 40],
+            image_data=["image-data"],
+            video_data=None,
+            audio_data=None,
+            modalities=["image"],
+            stop=[],
+        )
+
+        with patch.object(
+            self.chat,
+            "_apply_jinja_template",
+            return_value=processed_messages,
+        ) as apply_template:
+            result = self.chat._process_messages(request, is_multimodal=True)
+
+        self.assertIs(result, processed_messages)
+        apply_template.assert_called_once()
+        self.assertIs(
+            self.chat.traj_map[request.traj_id].cached_request,
+            request,
+        )
+
+    def test_multimodal_trajectory_rejects_changed_message_prefix(self):
+        self.template_manager.chat_template_name = None
+        self.tm.model_config.is_multimodal = True
+        cached_request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Describe the image"}],
+            traj_id="mm-trajectory",
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Describe a different image"},
+                {"role": "user", "content": "What color is it?"},
+            ],
+            traj_id="mm-trajectory",
+        )
+        self.chat.traj_map[request.traj_id] = Trajectory(
+            cached_token_ids=[1, 10, 2],
+            output_token_mask=[0, 0, 0],
+            cached_token_logprobs=[0] * 3,
+            cached_request=cached_request,
+            cached_tools_text="None",
+            eos_token_id=2,
+        )
+        processed_messages = MessageProcessingResult(
+            prompt="changed rendered prompt",
+            prompt_ids=[1, 11, 2, 40],
+            image_data=["image-data"],
+            video_data=None,
+            audio_data=None,
+            modalities=["image"],
+            stop=[],
+        )
+
+        with patch.object(
+            self.chat,
+            "_apply_jinja_template",
+            return_value=processed_messages,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "The new prompt does not start with the cached prompt",
+        ):
+            self.chat._process_messages(request, is_multimodal=True)
+
+    def test_multimodal_trajectory_caches_expanded_prompt_and_raw_output_ids(self):
+        self.tm.model_config.is_multimodal = True
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Describe the image"}],
+            traj_id="mm-trajectory",
+        )
+        self.chat.traj_map[request.traj_id] = Trajectory(
+            cached_token_ids=[],
+            output_token_mask=[],
+            cached_token_logprobs=[],
+            cached_request=request,
+            cached_tools_text="None",
+            eos_token_id=2,
+        )
+        ret = [
+            {
+                "text": "A cat.",
+                "output_ids": [20, 21, 2],
+                "meta_info": {
+                    "id": "chatcmpl-mm",
+                    "input_ids": [1, 151655, 151655, 13],
+                    "prompt_tokens": 4,
+                    "completion_tokens": 3,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": 2},
+                    "weight_version": "test",
+                },
+            }
+        ]
+
+        self.chat._build_chat_response(request, ret, created=0)
+
+        trajectory = self.chat.traj_map[request.traj_id]
+        self.assertEqual(
+            trajectory.cached_token_ids,
+            [1, 151655, 151655, 13, 20, 21, 2],
+        )
+        self.assertEqual(trajectory.output_token_mask, [0, 0, 0, 0, 1, 1, 1])
+        self.assertNotIn("input_ids", ret[0]["meta_info"])
+
+    def test_multimodal_trajectory_accepts_additional_eos_token(self):
+        self.tm.model_config.is_multimodal = True
+        self.tm.model_config.hf_eos_token_id = {1, 106}
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Describe the image"}],
+            traj_id="mm-trajectory",
+        )
+        self.chat.traj_map[request.traj_id] = Trajectory(
+            cached_token_ids=[],
+            output_token_mask=[],
+            cached_token_logprobs=[],
+            cached_request=request,
+            cached_tools_text="None",
+            eos_token_id=1,
+        )
+        ret = [
+            {
+                "text": "A cat.",
+                "output_ids": [20, 21, 106],
+                "meta_info": {
+                    "id": "chatcmpl-gemma-mm",
+                    "input_ids": [2, 10, 106, 105],
+                    "prompt_tokens": 4,
+                    "completion_tokens": 3,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": 106},
+                    "weight_version": "test",
+                },
+            }
+        ]
+
+        self.chat._build_chat_response(request, ret, created=0)
+
+        trajectory = self.chat.traj_map[request.traj_id]
+        self.assertEqual(trajectory.eos_token_id, 106)
+        self.assertEqual(
+            trajectory.cached_token_ids,
+            [2, 10, 106, 105, 20, 21, 106],
+        )
+        self.assertEqual(trajectory.output_token_mask, [0, 0, 0, 0, 1, 1, 1])
+
+    def test_multimodal_trajectory_length_finish_appends_template_eos(self):
+        self.tm.model_config.is_multimodal = True
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Describe the image"}],
+            traj_id="mm-trajectory",
+        )
+        self.chat.traj_map[request.traj_id] = Trajectory(
+            cached_token_ids=[],
+            output_token_mask=[],
+            cached_token_logprobs=[],
+            cached_request=request,
+            cached_tools_text="None",
+            eos_token_id=106,
+        )
+        ret = [
+            {
+                "text": "A",
+                "output_ids": [20],
+                "meta_info": {
+                    "id": "chatcmpl-gemma-mm-length",
+                    "input_ids": [2, 10, 106, 105],
+                    "prompt_tokens": 4,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "length", "matched": None},
+                    "weight_version": "test",
+                },
+            }
+        ]
+
+        self.chat._build_chat_response(request, ret, created=0)
+
+        trajectory = self.chat.traj_map[request.traj_id]
+        self.assertEqual(
+            trajectory.cached_token_ids,
+            [2, 10, 106, 105, 20, 106],
+        )
+        self.assertEqual(trajectory.output_token_mask, [0, 0, 0, 0, 1, 0])
+
+    def test_multimodal_trajectory_continuation_preserves_raw_output_ids(self):
+        self.tm.model_config.is_multimodal = True
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What color is it?"}],
+            traj_id="mm-trajectory",
+        )
+        original_ids = [1, 151655, 151655, 13, 20, 21, 2]
+        self.chat.traj_map[request.traj_id] = Trajectory(
+            cached_token_ids=original_ids.copy(),
+            output_token_mask=[0, 0, 0, 0, 1, 1, 1],
+            cached_token_logprobs=[0] * len(original_ids),
+            cached_request=request,
+            cached_tools_text="None",
+            eos_token_id=2,
+        )
+        ret = [
+            {
+                "text": "Orange.",
+                "output_ids": [40, 2],
+                "meta_info": {
+                    "id": "chatcmpl-mm-2",
+                    # The tokenizer manager has already restored the raw prior
+                    # answer. The response path must append only the new suffix.
+                    "input_ids": original_ids + [32, 33, 2, 34],
+                    "prompt_tokens": 11,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": 2},
+                    "weight_version": "test",
+                },
+            }
+        ]
+
+        self.chat._build_chat_response(request, ret, created=0)
+
+        trajectory = self.chat.traj_map[request.traj_id]
+        self.assertEqual(
+            trajectory.cached_token_ids,
+            original_ids + [32, 33, 2, 34, 40, 2],
+        )
+        self.assertEqual(
+            trajectory.output_token_mask,
+            [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1],
+        )
 
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
