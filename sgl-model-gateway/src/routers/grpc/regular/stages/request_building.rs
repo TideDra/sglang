@@ -17,7 +17,7 @@ use crate::routers::{
 };
 
 /// Request building stage (delegates to endpoint-specific implementations)
-pub(crate) struct RequestBuildingStage {
+pub struct RequestBuildingStage {
     chat_stage: ChatRequestBuildingStage,
     generate_stage: GenerateRequestBuildingStage,
     embedding_stage: EmbeddingRequestBuildingStage,

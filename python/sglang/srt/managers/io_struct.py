@@ -266,6 +266,17 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # Whether to include the post-tokenization input IDs in the response metadata.
+    # This is used internally by multimodal trajectory tracking because the final
+    # prompt IDs are produced by the multimodal processor, not the chat template.
+    return_input_ids: bool = False
+
+    # Internal multimodal trajectory fields. The tokenizer manager replaces the
+    # re-tokenized history with these original model token IDs after multimodal
+    # preprocessing has expanded the image placeholders.
+    trajectory_input_ids: Optional[List[int]] = None
+    trajectory_eos_token_id: Optional[int] = None
+
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict] = None
 
@@ -682,6 +693,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            return_input_ids=self.return_input_ids,
+            trajectory_input_ids=self.trajectory_input_ids,
+            trajectory_eos_token_id=self.trajectory_eos_token_id,
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             **{

@@ -137,6 +137,13 @@ class TestGemma3itServer(ImageOpenAITestMixin):
     ]
 
 
+class TestPhi35VisionServer(ImageOpenAITestMixin):
+    model = "microsoft/Phi-3.5-vision-instruct"
+    extra_args = [
+        "--cuda-graph-max-bs=4",
+    ]
+
+
 class TestKimiVLServer(ImageOpenAITestMixin):
     model = "moonshotai/Kimi-VL-A3B-Instruct"
     extra_args = [

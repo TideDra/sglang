@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use dashmap::DashMap;
+
 use async_trait::async_trait;
 use axum::{
     http::HeaderMap,
@@ -11,17 +13,19 @@ use super::{
     common::responses::{
         handlers::{cancel_response_impl, get_response_impl},
         utils::validate_worker_availability,
-        ResponsesContext,
     },
     context::SharedComponents,
-    harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
+    harmony::{
+        serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector,
+        HarmonyResponsesContext,
+    },
     pipeline::RequestPipeline,
     regular::responses,
 };
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    core::{is_retryable_status, RetryExecutor, WorkerRegistry, UNKNOWN_MODEL_ID},
+    core::{is_retryable_status, RetryExecutor, WorkerRegistry},
     observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
@@ -30,11 +34,12 @@ use crate::{
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{error, RouterTrait},
 };
 
 /// gRPC router implementation for SGLang
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,
@@ -42,8 +47,8 @@ pub struct GrpcRouter {
     embedding_pipeline: RequestPipeline,
     classify_pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
-    responses_context: ResponsesContext,
-    harmony_responses_context: ResponsesContext,
+    responses_context: responses::ResponsesContext,
+    harmony_responses_context: responses::ResponsesContext,
     retry_config: RetryConfig,
 }
 
@@ -72,6 +77,7 @@ impl GrpcRouter {
             tokenizer_registry: tokenizer_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
+            trajectory_map: DashMap::new(),
         });
 
         // Create regular pipeline
@@ -111,9 +117,10 @@ impl GrpcRouter {
 
         // Helper closure to create responses context with a given pipeline
         let create_responses_context = |pipeline: &RequestPipeline| {
-            ResponsesContext::new(
+            responses::ResponsesContext::new(
                 Arc::new(pipeline.clone()),
                 shared_components.clone(),
+                worker_registry.clone(),
                 ctx.response_storage.clone(),
                 ctx.conversation_storage.clone(),
                 ctx.conversation_item_storage.clone(),
@@ -150,9 +157,8 @@ impl GrpcRouter {
             HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
 
         debug!(
-            "Processing chat completion request for model: {}, using_harmony={}",
-            model_id.unwrap_or(UNKNOWN_MODEL_ID),
-            is_harmony
+            "Processing chat completion request for model: {:?}, using_harmony={}",
+            model_id, is_harmony
         );
 
         let pipeline = if is_harmony {
@@ -209,10 +215,7 @@ impl GrpcRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        debug!(
-            "Processing generate request for model: {}",
-            model_id.unwrap_or(UNKNOWN_MODEL_ID)
-        );
+        debug!("Processing generate request for model: {:?}", model_id);
 
         // Clone values needed for retry closure
         let request = Arc::new(body.clone());
@@ -280,19 +283,18 @@ impl GrpcRouter {
 
         if is_harmony {
             debug!(
-                "Processing Harmony responses request for model: {}, streaming: {}",
-                model_id.unwrap_or(UNKNOWN_MODEL_ID),
-                body.stream.unwrap_or(false)
+                "Processing Harmony responses request for model: {:?}, streaming: {:?}",
+                model_id, body.stream
             );
-            let harmony_ctx = ResponsesContext::new(
+            let harmony_ctx = HarmonyResponsesContext::new(
                 Arc::new(self.harmony_pipeline.clone()),
                 self.shared_components.clone(),
+                self.harmony_responses_context.mcp_manager.clone(),
                 self.harmony_responses_context.response_storage.clone(),
                 self.harmony_responses_context.conversation_storage.clone(),
                 self.harmony_responses_context
                     .conversation_item_storage
                     .clone(),
-                self.harmony_responses_context.mcp_manager.clone(),
             );
 
             if body.stream.unwrap_or(false) {
@@ -321,10 +323,7 @@ impl GrpcRouter {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        debug!(
-            "Processing embedding request for model: {}",
-            model_id.unwrap_or(UNKNOWN_MODEL_ID)
-        );
+        debug!("Processing embedding request for model: {:?}", model_id);
 
         self.embedding_pipeline
             .execute_embeddings(
@@ -343,10 +342,7 @@ impl GrpcRouter {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        debug!(
-            "Processing classify request for model: {}",
-            model_id.unwrap_or(UNKNOWN_MODEL_ID)
-        );
+        debug!("Processing classify request for model: {:?}", model_id);
 
         self.classify_pipeline
             .execute_classify(
@@ -356,6 +352,30 @@ impl GrpcRouter {
                 self.shared_components.clone(),
             )
             .await
+    }
+
+    /// Main get_trajectory implementation
+    async fn get_trajectory_impl(
+        &self,
+        _headers: Option<&HeaderMap>,
+        traj_id: &str,
+    ) -> Response {
+        match self.shared_components.trajectory_map.get(traj_id) {
+            Some(traj) => axum::Json(traj.value()).into_response(),
+            None => error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id)),
+        }
+    }
+
+    /// Main delete_trajectory implementation
+    async fn delete_trajectory_impl(
+        &self,
+        _headers: Option<&HeaderMap>,
+        traj_id: &str,
+    ) -> Response {
+        match self.shared_components.trajectory_map.remove(traj_id) {
+            Some(_) => axum::Json(serde_json::json!({ "message": "Trajectory deleted" })).into_response(),
+            None => error::not_found("trajectory_not_found", format!("Trajectory with id '{}' not found", traj_id)),
+        }
     }
 }
 
@@ -430,6 +450,14 @@ impl RouterTrait for GrpcRouter {
         model_id: Option<&str>,
     ) -> Response {
         self.route_classify_impl(headers, body, model_id).await
+    }
+
+    async fn get_trajectory(&self, _headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        self.get_trajectory_impl(_headers, traj_id).await
+    }
+
+    async fn delete_trajectory(&self, _headers: Option<&HeaderMap>, traj_id: &str) -> Response {
+        self.delete_trajectory_impl(_headers, traj_id).await
     }
 
     fn router_type(&self) -> &'static str {

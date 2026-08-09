@@ -11,9 +11,6 @@ use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use serde_json::json;
-use smg_grpc_client::sglang_proto::generate_complete::MatchedStop::{
-    MatchedStopStr, MatchedTokenId,
-};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
@@ -22,6 +19,7 @@ use super::{
     processor::ResponsesIterationResult, types::HarmonyChannelDelta, HarmonyParserAdapter,
 };
 use crate::{
+    grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     protocols::{
         chat::{
@@ -107,7 +105,7 @@ impl ToolCallMode {
 ///
 /// Returns an SSE stream that parses Harmony tokens incrementally and
 /// emits ChatCompletionChunk events for streaming responses.
-pub(crate) struct HarmonyStreamingProcessor;
+pub struct HarmonyStreamingProcessor;
 
 impl HarmonyStreamingProcessor {
     /// Create a new Harmony streaming processor
@@ -826,7 +824,7 @@ impl HarmonyStreamingProcessor {
                             let call_index = tc_delta.index;
 
                             // Check if this is a new tool call (has id and name)
-                            if let Some(call_id) = &tc_delta.id {
+                            if tc_delta.id.is_some() {
                                 // Get tool name first to determine mode
                                 let tool_name = tc_delta
                                     .function
@@ -857,6 +855,7 @@ impl HarmonyStreamingProcessor {
                                     .insert(call_index, (output_index, item_id.clone(), tool_mode));
 
                                 // Emit output_item.added wrapper event
+                                let call_id = tc_delta.id.as_ref().unwrap();
                                 let mut item = json!({
                                     "id": item_id,
                                     "type": tool_mode.type_str(),

@@ -20,7 +20,7 @@ use crate::routers::{
 };
 
 /// Preparation stage (delegates to endpoint-specific implementations)
-pub(crate) struct PreparationStage {
+pub struct PreparationStage {
     chat_stage: ChatPreparationStage,
     generate_stage: GeneratePreparationStage,
     embedding_stage: EmbeddingPreparationStage,

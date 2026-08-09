@@ -42,6 +42,19 @@ from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content
 
 logger = logging.getLogger(__name__)
 
+BUILTIN_JINJA_CHAT_TEMPLATES = {
+    # The upstream Phi-3 Vision template treats content as plain text and drops
+    # OpenAI image parts. Its generated turns also end with both <|end|> and the
+    # tokenizer EOS, which trajectory continuation must reconstruct exactly.
+    "phi3_v": os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "parser",
+        "chat_templates",
+        "phi3_vision.jinja",
+    ),
+}
+
 
 class TemplateManager:
     """
@@ -115,6 +128,8 @@ class TemplateManager:
         """
         if chat_template_arg:
             self._load_explicit_chat_template(tokenizer_manager, chat_template_arg)
+        elif self._load_builtin_jinja_template(tokenizer_manager):
+            pass
         else:
             # Guess chat template from model path
             self.guess_chat_template_from_model_path(model_path)
@@ -145,6 +160,20 @@ class TemplateManager:
             self._force_reasoning = self._detect_reasoning_pattern(
                 tokenizer_manager.tokenizer.chat_template
             )
+
+    def _load_builtin_jinja_template(self, tokenizer_manager: TokenizerManager) -> bool:
+        model_type = getattr(
+            getattr(tokenizer_manager.model_config, "hf_config", None),
+            "model_type",
+            None,
+        )
+        template_path = BUILTIN_JINJA_CHAT_TEMPLATES.get(model_type)
+        if template_path is None:
+            return False
+
+        logger.info("Using built-in Jinja chat template for model type: %s", model_type)
+        self._load_jinja_template(tokenizer_manager, template_path)
+        return True
 
     def _load_explicit_chat_template(
         self, tokenizer_manager: TokenizerManager, chat_template_arg: str

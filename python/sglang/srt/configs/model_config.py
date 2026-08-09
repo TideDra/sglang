@@ -178,8 +178,9 @@ class ModelConfig:
             self.hf_config.architectures
         )
         # TODO: requires further polishing
-        self.is_image_understandable_model = enable_multimodal and hasattr(
-            self.hf_config, "vision_config"
+        self.is_image_understandable_model = enable_multimodal and (
+            hasattr(self.hf_config, "vision_config")
+            or hasattr(self.hf_config, "img_processor")
         )
         self.is_audio_understandable_model = enable_multimodal and hasattr(
             self.hf_config, "audio_config"
@@ -1247,6 +1248,7 @@ multimodal_model_archs = [
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
+    "Phi3VForCausalLM",
     "Phi4MMForCausalLM",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",

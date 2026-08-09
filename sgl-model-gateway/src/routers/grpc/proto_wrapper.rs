@@ -4,7 +4,8 @@
 //! allowing the router to work with either backend transparently.
 
 use futures_util::StreamExt;
-use smg_grpc_client::{
+
+use crate::grpc_client::{
     sglang_proto::{self as sglang, generate_complete::MatchedStop},
     sglang_scheduler::AbortOnDropStream as SglangStream,
     vllm_engine::AbortOnDropStream as VllmStream,
@@ -19,7 +20,20 @@ pub enum ProtoRequest {
 }
 
 impl ProtoRequest {
-    /// Get request ID from either variant
+    pub fn as_generate(&self) -> &ProtoGenerateRequest {
+        match self {
+            Self::Generate(req) => req,
+            _ => panic!("Expected Generate request"),
+        }
+    }
+
+    pub fn as_embed(&self) -> &ProtoEmbedRequest {
+        match self {
+            Self::Embed(req) => req,
+            _ => panic!("Expected Embed request"),
+        }
+    }
+
     pub fn request_id(&self) -> &str {
         match self {
             Self::Generate(req) => req.request_id(),
@@ -94,7 +108,7 @@ impl ProtoGenerateRequest {
 
 /// Unified GenerateResponse from stream
 pub enum ProtoGenerateResponse {
-    Sglang(Box<sglang::GenerateResponse>),
+    Sglang(sglang::GenerateResponse),
     Vllm(vllm::GenerateResponse),
 }
 
@@ -123,7 +137,9 @@ impl ProtoGenerateResponse {
                 Some(vllm::generate_response::Response::Complete(complete)) => {
                     ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(complete))
                 }
-                // Note: vLLM proto no longer has Error variant in GenerateResponse
+                Some(vllm::generate_response::Response::Error(error)) => {
+                    ProtoResponseVariant::Error(ProtoGenerateError::Vllm(error))
+                }
                 None => ProtoResponseVariant::None,
             },
         }
@@ -201,7 +217,7 @@ impl ProtoGenerateStreamChunk {
     pub fn prompt_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens as i32,
+            Self::Vllm(c) => c.prompt_tokens,
         }
     }
 
@@ -209,7 +225,7 @@ impl ProtoGenerateStreamChunk {
     pub fn completion_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens as i32,
+            Self::Vllm(c) => c.completion_tokens,
         }
     }
 
@@ -217,7 +233,7 @@ impl ProtoGenerateStreamChunk {
     pub fn cached_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(c) => c.cached_tokens as i32,
+            Self::Vllm(c) => c.cached_tokens,
         }
     }
 }
@@ -276,7 +292,7 @@ impl ProtoGenerateComplete {
     pub fn prompt_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens as i32,
+            Self::Vllm(c) => c.prompt_tokens,
         }
     }
 
@@ -284,7 +300,7 @@ impl ProtoGenerateComplete {
     pub fn completion_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens as i32,
+            Self::Vllm(c) => c.completion_tokens,
         }
     }
 
@@ -326,7 +342,7 @@ impl ProtoGenerateComplete {
     pub fn cached_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(c) => c.cached_tokens as i32,
+            Self::Vllm(_) => 0, // vLLM doesn't have cached_tokens field
         }
     }
 
@@ -348,10 +364,10 @@ impl ProtoGenerateComplete {
 }
 
 /// Unified GenerateError
-/// Note: vLLM proto no longer has GenerateError - errors are returned via gRPC status
 #[derive(Clone)]
 pub enum ProtoGenerateError {
     Sglang(sglang::GenerateError),
+    Vllm(vllm::GenerateError),
 }
 
 impl ProtoGenerateError {
@@ -359,6 +375,7 @@ impl ProtoGenerateError {
     pub fn message(&self) -> &str {
         match self {
             Self::Sglang(e) => &e.message,
+            Self::Vllm(e) => &e.message,
         }
     }
 }
@@ -376,7 +393,7 @@ impl ProtoStream {
             Self::Sglang(stream) => stream
                 .next()
                 .await
-                .map(|result| result.map(|r| ProtoGenerateResponse::Sglang(Box::new(r)))),
+                .map(|result| result.map(ProtoGenerateResponse::Sglang)),
             Self::Vllm(stream) => stream
                 .next()
                 .await

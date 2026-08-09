@@ -1,10 +1,10 @@
 use super::*;
 
 /// Configuration validator
-pub(crate) struct ConfigValidator;
+pub struct ConfigValidator;
 
 impl ConfigValidator {
-    pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+    pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;

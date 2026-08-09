@@ -6,22 +6,19 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::{
-    core::AttachedBody,
-    routers::{
-        error,
-        grpc::{
-            common::stages::PipelineStage,
-            context::{FinalResponse, RequestContext},
-            regular::{processor, streaming},
-        },
+use crate::routers::{
+    error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{FinalResponse, RequestContext},
+        regular::{processor, streaming},
     },
 };
 
 /// Generate response processing stage
 ///
 /// Extracts generate-specific response processing logic from the old unified ResponseProcessingStage.
-pub(crate) struct GenerateResponseProcessingStage {
+pub struct GenerateResponseProcessingStage {
     processor: processor::ResponseProcessor,
     streaming_processor: Arc<streaming::StreamingProcessor>,
 }
@@ -103,7 +100,7 @@ impl GenerateResponseProcessingStage {
 
             // Attach load guards to response body for proper RAII lifecycle
             let response = match ctx.state.load_guards.take() {
-                Some(guards) => AttachedBody::wrap_response(response, guards),
+                Some(guards) => guards.attach_to_response(response),
                 None => response,
             };
 

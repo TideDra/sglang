@@ -33,6 +33,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -102,6 +103,7 @@ from sglang.srt.tracing.trace import (
 )
 from sglang.srt.utils import (
     configure_gc_warning,
+    find_nth_token_index,
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
@@ -136,6 +138,7 @@ class ReqState:
 
     # For metrics
     created_time: float
+    input_ids: Optional[List[int]] = None
     finished_time: float = 0.0
     first_token_time: float = 0.0
     last_time: float = 0.0
@@ -735,6 +738,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+                input_ids = self._restore_multimodal_trajectory_input(
+                    obj, input_ids, mm_inputs
+                )
+            elif getattr(obj, "trajectory_input_ids", None):
+                raise ValueError(
+                    "Multimodal trajectory tracking requires processor input IDs"
+                )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -751,6 +761,186 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+
+    @staticmethod
+    def _restore_multimodal_trajectory_input(
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        processed_input_ids: List[int],
+        mm_inputs: Dict,
+    ) -> List[int]:
+        """Restore raw trajectory IDs after multimodal prompt processing.
+
+        The processor must see the rendered text so it can expand image tokens
+        and produce image features. It also re-tokenizes prior assistant turns,
+        however, so replace that processed prefix with the original token IDs
+        before sending the request to the scheduler.
+        """
+        cached_input_ids = getattr(obj, "trajectory_input_ids", None)
+        if not cached_input_ids:
+            return processed_input_ids
+
+        eos_token_id = getattr(obj, "trajectory_eos_token_id", None)
+        if eos_token_id is None:
+            raise ValueError(
+                "Multimodal trajectory input is missing its turn-boundary token ID"
+            )
+
+        cached_eos_count = cached_input_ids.count(eos_token_id)
+        if cached_eos_count == 0:
+            raise ValueError(
+                "Multimodal trajectory input does not contain its turn-boundary token"
+            )
+
+        processed_prefix_end = find_nth_token_index(
+            processed_input_ids, eos_token_id, cached_eos_count
+        )
+        if processed_prefix_end is None:
+            raise ValueError(
+                "The multimodal continuation prompt does not contain all "
+                "cached trajectory turn-boundary tokens"
+            )
+        processed_prefix_len = processed_prefix_end + 1
+
+        combined_input_ids = (
+            list(cached_input_ids) + processed_input_ids[processed_prefix_len:]
+        )
+        mapped_offsets = TokenizerManager._remap_multimodal_offsets(
+            processed_input_ids,
+            combined_input_ids,
+            mm_inputs,
+        )
+        TokenizerManager._restore_mrope_positions(
+            processed_input_ids,
+            combined_input_ids,
+            mm_inputs,
+            mapped_offsets,
+        )
+        mm_inputs["input_ids"] = combined_input_ids
+        return combined_input_ids
+
+    @staticmethod
+    def _remap_multimodal_offsets(
+        processed_input_ids: List[int],
+        combined_input_ids: List[int],
+        mm_inputs: Dict,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Move processor-produced multimodal spans to their restored indices."""
+        offset_refs = []
+        for item in mm_inputs.get("mm_items", []):
+            offsets = (
+                item.offsets
+                if isinstance(item, MultimodalDataItem)
+                else item.get("offsets")
+            )
+            for offset_index, (start, end) in enumerate(offsets or []):
+                offset_refs.append((int(start), int(end), item, offset_index))
+
+        offset_refs.sort(key=lambda entry: entry[0])
+        mapped_offsets = []
+        search_start = 0
+        for old_start, old_end, item, offset_index in offset_refs:
+            span = processed_input_ids[old_start : old_end + 1]
+            if not span:
+                raise ValueError("Multimodal processor returned an empty offset span")
+
+            new_start = TokenizerManager._find_token_subsequence(
+                combined_input_ids, span, search_start
+            )
+            if new_start is None:
+                raise ValueError(
+                    "Unable to align multimodal input offsets after restoring "
+                    "trajectory token IDs"
+                )
+            new_end = new_start + len(span) - 1
+            offsets = (
+                item.offsets
+                if isinstance(item, MultimodalDataItem)
+                else item["offsets"]
+            )
+            offsets[offset_index] = (new_start, new_end)
+            mapped_offsets.append((old_start, old_end, new_start, new_end))
+            search_start = new_end + 1
+
+        return mapped_offsets
+
+    @staticmethod
+    def _find_token_subsequence(
+        token_ids: List[int], subsequence: List[int], start: int
+    ) -> Optional[int]:
+        last_start = len(token_ids) - len(subsequence)
+        index = start
+        while index <= last_start:
+            try:
+                index = token_ids.index(subsequence[0], index, last_start + 1)
+            except ValueError:
+                return None
+            if token_ids[index : index + len(subsequence)] == subsequence:
+                return index
+            index += 1
+        return None
+
+    @staticmethod
+    def _restore_mrope_positions(
+        processed_input_ids: List[int],
+        combined_input_ids: List[int],
+        mm_inputs: Dict,
+        mapped_offsets: List[Tuple[int, int, int, int]],
+    ) -> None:
+        """Rebuild MRoPE metadata around the remapped image-token spans."""
+        positions = mm_inputs.get("mrope_positions")
+        if positions is None or len(processed_input_ids) == len(combined_input_ids):
+            return
+        if positions.ndim != 2 or positions.shape[1] != len(processed_input_ids):
+            raise ValueError(
+                "Multimodal processor returned MRoPE positions that do not "
+                "match its input IDs"
+            )
+
+        mapped_offsets.sort(key=lambda entry: entry[2])
+        rebuilt = positions.new_empty((positions.shape[0], len(combined_input_ids)))
+        new_cursor = 0
+        next_position = 0
+
+        for old_start, old_end, new_start, new_end in mapped_offsets:
+            if new_start < new_cursor:
+                raise ValueError("Multimodal input offsets overlap")
+
+            text_len = new_start - new_cursor
+            if text_len:
+                text_positions = torch.arange(
+                    next_position,
+                    next_position + text_len,
+                    dtype=positions.dtype,
+                    device=positions.device,
+                )
+                rebuilt[:, new_cursor:new_start] = text_positions.unsqueeze(0)
+                next_position += text_len
+
+            old_block = positions[:, old_start : old_end + 1]
+            if old_block.shape[1] != new_end - new_start + 1:
+                raise ValueError("Multimodal input span length changed unexpectedly")
+            shift = next_position - old_block[:, 0].max()
+            rebuilt[:, new_start : new_end + 1] = old_block + shift
+            next_position = rebuilt[:, new_start : new_end + 1].max().item() + 1
+            new_cursor = new_end + 1
+
+        tail_len = len(combined_input_ids) - new_cursor
+        if tail_len:
+            tail_positions = torch.arange(
+                next_position,
+                next_position + tail_len,
+                dtype=positions.dtype,
+                device=positions.device,
+            )
+            rebuilt[:, new_cursor:] = tail_positions.unsqueeze(0)
+
+        mm_inputs["mrope_positions"] = rebuilt
+        position_delta = mm_inputs.get("mrope_position_delta")
+        if position_delta is not None:
+            delta = rebuilt.max() + 1 - len(combined_input_ids)
+            mm_inputs["mrope_position_delta"] = torch.full_like(
+                position_delta, delta.item()
+            )
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -1069,7 +1259,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         tokenized_obj = wrap_shm_features(tokenized_obj)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = self.req_state_class(
-            [], False, asyncio.Event(), obj, created_time=created_time
+            [],
+            False,
+            asyncio.Event(),
+            obj,
+            created_time=created_time,
+            input_ids=(
+                tokenized_obj.input_ids
+                if getattr(obj, "return_input_ids", False)
+                else None
+            ),
         )
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
@@ -1097,7 +1296,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
             state = self.req_state_class(
-                [], False, asyncio.Event(), tmp_obj, created_time=created_time
+                [],
+                False,
+                asyncio.Event(),
+                tmp_obj,
+                created_time=created_time,
+                input_ids=(
+                    tokenized_obj.input_ids
+                    if getattr(tmp_obj, "return_input_ids", False)
+                    else None
+                ),
             )
             self.rid_to_state[tmp_obj.rid] = state
 
@@ -1502,6 +1710,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "weight_version": self.server_args.weight_version,
                 "total_retractions": recv_obj.retraction_counts[i],
             }
+            if getattr(state.obj, "return_input_ids", False):
+                meta_info["input_ids"] = state.input_ids
 
             if self.enable_metrics:
                 self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)

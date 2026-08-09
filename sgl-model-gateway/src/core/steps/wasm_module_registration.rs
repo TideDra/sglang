@@ -9,19 +9,15 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use wasmtime::{component::Component, Config, Engine};
-use wfaas::{
-    BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
-    WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
-};
 
-use super::workflow_data::WasmRegistrationWorkflowData;
 use crate::{
     app_context::AppContext,
     wasm::module::{WasmModule, WasmModuleDescriptor, WasmModuleMeta},
+    workflow::*,
 };
 
 /// WASM module registration request
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct WasmModuleConfigRequest {
     /// Module descriptor containing name, file_path, attach_points, etc.
     pub descriptor: WasmModuleDescriptor,
@@ -65,12 +61,12 @@ fn has_wasm_extension(path: &Path) -> bool {
 pub struct ValidateDescriptorStep;
 
 #[async_trait]
-impl StepExecutor<WasmRegistrationWorkflowData> for ValidateDescriptorStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let descriptor = &context.data.config.descriptor;
+impl StepExecutor for ValidateDescriptorStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+
+        let descriptor = &config_request.descriptor;
 
         debug!("Validating WASM module descriptor: {}", descriptor.name);
 
@@ -202,15 +198,12 @@ impl StepExecutor<WasmRegistrationWorkflowData> for ValidateDescriptorStep {
             });
         }
 
-        // Clone name for logging before mutable borrow
-        let module_name = descriptor.name.clone();
-
-        // Store file size in typed data
-        context.data.file_size_bytes = Some(metadata.len());
+        // Store file size in context for later steps
+        context.set("file_size_bytes", metadata.len());
 
         info!(
             "Descriptor validated successfully for module: {}",
-            module_name
+            descriptor.name
         );
         Ok(StepResult::Success)
     }
@@ -227,12 +220,12 @@ impl StepExecutor<WasmRegistrationWorkflowData> for ValidateDescriptorStep {
 pub struct CalculateHashStep;
 
 #[async_trait]
-impl StepExecutor<WasmRegistrationWorkflowData> for CalculateHashStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let file_path = &context.data.config.descriptor.file_path;
+impl StepExecutor for CalculateHashStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+
+        let file_path = &config_request.descriptor.file_path;
 
         debug!("Calculating SHA256 hash for: {}", file_path);
 
@@ -267,13 +260,10 @@ impl StepExecutor<WasmRegistrationWorkflowData> for CalculateHashStep {
 
         let hash: [u8; 32] = hasher.finalize().into();
 
-        // Clone path for logging before mutable borrow
-        let path_for_log = file_path.clone();
+        // Store hash in context
+        context.set("sha256_hash", hash);
 
-        // Store hash in typed data
-        context.data.sha256_hash = Some(hash);
-
-        info!("SHA256 hash calculated for: {}", path_for_log);
+        info!("SHA256 hash calculated for: {}", file_path);
         Ok(StepResult::Success)
     }
 
@@ -289,25 +279,16 @@ impl StepExecutor<WasmRegistrationWorkflowData> for CalculateHashStep {
 pub struct CheckDuplicateStep;
 
 #[async_trait]
-impl StepExecutor<WasmRegistrationWorkflowData> for CheckDuplicateStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let sha256_hash = context
-            .data
-            .sha256_hash
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("sha256_hash".to_string()))?;
+impl StepExecutor for CheckDuplicateStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let sha256_hash: Arc<[u8; 32]> = context.get_or_err("sha256_hash")?;
 
         debug!(
             "Checking for duplicate SHA256 hash for module: {}",
-            context.data.config.descriptor.name
+            config_request.descriptor.name
         );
 
         // Get WASM module manager from app context
@@ -322,7 +303,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for CheckDuplicateStep {
 
         // Check for duplicate hash using manager's internal method
         wasm_manager
-            .check_duplicate_sha256_hash(sha256_hash)
+            .check_duplicate_sha256_hash(sha256_hash.as_ref())
             .map_err(|e| WorkflowError::StepFailed {
                 step_id: StepId::new("check_duplicate"),
                 message: format!("Duplicate SHA256 hash detected: {}", e),
@@ -330,7 +311,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for CheckDuplicateStep {
 
         info!(
             "No duplicate found for module: {}",
-            context.data.config.descriptor.name
+            config_request.descriptor.name
         );
         Ok(StepResult::Success)
     }
@@ -347,17 +328,14 @@ impl StepExecutor<WasmRegistrationWorkflowData> for CheckDuplicateStep {
 pub struct LoadWasmBytesStep;
 
 #[async_trait]
-impl StepExecutor<WasmRegistrationWorkflowData> for LoadWasmBytesStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let file_path = &context.data.config.descriptor.file_path;
+impl StepExecutor for LoadWasmBytesStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+
+        let file_path = &config_request.descriptor.file_path;
 
         debug!("Loading WASM bytes from: {}", file_path);
-
-        // Clone path for logging before mutable borrow
-        let path_for_log = file_path.clone();
 
         let wasm_bytes =
             tokio::fs::read(file_path)
@@ -367,10 +345,10 @@ impl StepExecutor<WasmRegistrationWorkflowData> for LoadWasmBytesStep {
                     message: format!("Failed to read WASM file {}: {}", file_path, e),
                 })?;
 
-        // Store WASM bytes in typed data
-        context.data.wasm_bytes = Some(wasm_bytes);
+        // Store WASM bytes in context
+        context.set("wasm_bytes", wasm_bytes);
 
-        info!("WASM bytes loaded from: {}", path_for_log);
+        info!("WASM bytes loaded from: {}", file_path);
         Ok(StepResult::Success)
     }
 
@@ -386,20 +364,15 @@ impl StepExecutor<WasmRegistrationWorkflowData> for LoadWasmBytesStep {
 pub struct ValidateWasmComponentStep;
 
 #[async_trait]
-impl StepExecutor<WasmRegistrationWorkflowData> for ValidateWasmComponentStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let wasm_bytes = context
-            .data
-            .wasm_bytes
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_bytes".to_string()))?;
+impl StepExecutor for ValidateWasmComponentStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+        let wasm_bytes: Arc<Vec<u8>> = context.get_or_err("wasm_bytes")?;
 
         debug!(
             "Validating WASM component format for module: {}",
-            context.data.config.descriptor.name
+            config_request.descriptor.name
         );
 
         // Create a temporary engine to validate the component
@@ -413,7 +386,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for ValidateWasmComponentStep {
         })?;
 
         // Attempt to compile the component to validate it
-        Component::new(&engine, wasm_bytes)
+        Component::new(&engine, wasm_bytes.as_ref())
             .map_err(|e| WorkflowError::StepFailed {
                 step_id: StepId::new("validate_wasm_component"),
                 message: format!(
@@ -426,7 +399,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for ValidateWasmComponentStep {
 
         info!(
             "WASM component validated successfully for module: {}",
-            context.data.config.descriptor.name
+            config_request.descriptor.name
         );
         Ok(StepResult::Success)
     }
@@ -443,34 +416,19 @@ impl StepExecutor<WasmRegistrationWorkflowData> for ValidateWasmComponentStep {
 pub struct RegisterModuleStep;
 
 #[async_trait]
-impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let sha256_hash = context
-            .data
-            .sha256_hash
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("sha256_hash".to_string()))?;
-        let file_size_bytes = context
-            .data
-            .file_size_bytes
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("file_size_bytes".to_string()))?;
-        let wasm_bytes = context
-            .data
-            .wasm_bytes
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_bytes".to_string()))?
-            .clone();
+impl StepExecutor for RegisterModuleStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let sha256_hash: Arc<[u8; 32]> = context.get_or_err("sha256_hash")?;
+        let file_size_bytes: Arc<u64> = context.get_or_err("file_size_bytes")?;
+        let wasm_bytes: Arc<Vec<u8>> = context.get_or_err("wasm_bytes")?;
 
-        let descriptor = &context.data.config.descriptor;
-
-        debug!("Registering WASM module in manager: {}", descriptor.name);
+        debug!(
+            "Registering WASM module in manager: {}",
+            config_request.descriptor.name
+        );
 
         // Get WASM module manager from app context
         let wasm_manager =
@@ -493,20 +451,17 @@ impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
         let module = WasmModule {
             module_uuid,
             module_meta: WasmModuleMeta {
-                name: descriptor.name.clone(),
-                file_path: descriptor.file_path.clone(),
-                sha256_hash,
-                size_bytes: file_size_bytes,
+                name: config_request.descriptor.name.clone(),
+                file_path: config_request.descriptor.file_path.clone(),
+                sha256_hash: *sha256_hash.as_ref(),
+                size_bytes: *file_size_bytes.as_ref(),
                 created_at: now,
                 last_accessed_at: now,
                 access_count: 0,
-                attach_points: descriptor.attach_points.clone(),
-                wasm_bytes,
+                attach_points: config_request.descriptor.attach_points.clone(),
+                wasm_bytes: wasm_bytes.as_ref().clone(),
             },
         };
-
-        // Clone name for logging before mutable borrow
-        let module_name = descriptor.name.clone();
 
         // Register module in manager
         wasm_manager
@@ -516,12 +471,12 @@ impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
                 message: format!("Failed to register module: {}", e),
             })?;
 
-        // Store module UUID in typed data
-        context.data.module_uuid = Some(module_uuid);
+        // Store module UUID in context for return value
+        context.set("module_uuid", module_uuid);
 
         info!(
             "WASM module registered successfully: {} (UUID: {})",
-            module_name, module_uuid
+            config_request.descriptor.name, module_uuid
         );
 
         Ok(StepResult::Success)
@@ -549,8 +504,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
 /// - LoadWasmBytes: 3 retries, 60s timeout (I/O intensive)
 /// - ValidateWasmComponent: No retry, 30s timeout (CPU intensive validation)
 /// - RegisterModule: No retry, 5s timeout (fast registration)
-pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition<WasmRegistrationWorkflowData>
-{
+pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition {
     WorkflowDefinition::new("wasm_module_registration", "WASM Module Registration")
         .add_step(
             StepDefinition::new(
@@ -619,19 +573,4 @@ pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition<WasmRegi
             .with_failure_action(FailureAction::FailWorkflow)
             .depends_on(&["validate_wasm_component"]),
         )
-}
-
-/// Helper to create initial workflow data for WASM module registration
-pub fn create_wasm_registration_workflow_data(
-    config: WasmModuleConfigRequest,
-    app_context: Arc<AppContext>,
-) -> WasmRegistrationWorkflowData {
-    WasmRegistrationWorkflowData {
-        config,
-        wasm_bytes: None,
-        sha256_hash: None,
-        file_size_bytes: None,
-        module_uuid: None,
-        app_context: Some(app_context),
-    }
 }

@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
-use smg_mcp as mcp;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
 use crate::{
+    mcp,
     protocols::{
         chat::ChatCompletionStreamResponse,
         common::{Usage, UsageInfo},
@@ -25,7 +25,7 @@ use crate::{
     routers::grpc::harmony::responses::ToolResult,
 };
 
-pub(crate) enum OutputItemType {
+pub enum OutputItemType {
     Message,
     McpListTools,
     McpCall,
@@ -67,7 +67,7 @@ struct OutputItemState {
 /// - response.mcp_call_arguments.done
 /// - response.mcp_call.completed
 /// - response.mcp_call.failed
-pub(crate) struct ResponseStreamEventEmitter {
+pub struct ResponseStreamEventEmitter {
     sequence_number: u64,
     pub response_id: String,
     model: String,
@@ -828,9 +828,7 @@ impl ResponseStreamEventEmitter {
 /// Build a Server-Sent Events (SSE) response
 ///
 /// Creates a Response with proper SSE headers and streaming body.
-pub(crate) fn build_sse_response(
-    rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>,
-) -> Response {
+pub fn build_sse_response(rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>) -> Response {
     let stream = UnboundedReceiverStream::new(rx);
     Response::builder()
         .status(StatusCode::OK)

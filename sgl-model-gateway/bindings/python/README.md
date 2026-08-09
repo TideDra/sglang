@@ -6,22 +6,16 @@ This directory contains the Python bindings for the SGLang Router, built using [
 
 ```
 bindings/python/
-├── src/                    # Source code (src layout)
-│   ├── lib.rs              # Rust/PyO3 bindings implementation
-│   └── sglang_router/      # Python source code
-│       ├── __init__.py
-│       ├── version.py
-│       ├── launch_server.py
-│       ├── launch_router.py
-│       ├── router.py
-│       ├── router_args.py
-│       └── mini_lb.py
-├── tests/                  # Python unit tests
-│   ├── conftest.py
-│   ├── test_validation.py
-│   ├── test_arg_parser.py
-│   ├── test_router_config.py
-│   └── test_startup_sequence.py
+├── src/                    # Rust source code for Python bindings
+│   └── lib.rs              # PyO3 bindings implementation
+├── sglang_router/          # Python source code
+│   ├── __init__.py
+│   ├── version.py
+│   ├── launch_server.py
+│   ├── launch_router.py
+│   ├── router.py
+│   ├── router_args.py
+│   └── mini_lb.py
 ├── Cargo.toml              # Rust package configuration for bindings
 ├── pyproject.toml          # Python package configuration
 ├── setup.py                # Setup configuration
@@ -57,15 +51,15 @@ pip install dist/sglang_router-*.whl
 ## Testing
 
 ```bash
-# Run Python unit tests (after maturin develop)
-cd sgl-model-gateway/bindings/python
-pytest tests/
+# Run Python tests
+cd sgl-model-gateway
+pytest py_test/
 ```
 
 ## Configuration
 
 - **pyproject.toml**: Defines package metadata, dependencies, and build configuration
-- **python-source**: Set to `"src"` indicating Python source uses the src layout
+- **python-source**: Set to "." to indicate Python source is in the same directory as pyproject.toml
 - **module-name**: `sglang_router.sglang_router_rs` - the Rust extension module name
 
 ## Notes

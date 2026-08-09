@@ -1813,6 +1813,10 @@ class ServerArgs:
                     self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
+                elif model_config.head_dim not in (64, 128, 256, 512):
+                    # FlashInfer's cascade kernels only dispatch these head
+                    # dimensions. Models such as Phi-3 use 96-wide heads.
+                    self.attention_backend = "triton"
                 else:
                     self.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
